@@ -141,8 +141,6 @@ type Source struct {
 	RuntimeFilterSpecs []*plan.RuntimeFilterSpec
 	OrderBy            []*plan.OrderBySpec // for ordered scan
 
-	IndexReaderParam *plan.IndexReaderParam
-
 	RecvMsgList []plan.MsgHeader
 }
 

@@ -186,7 +186,7 @@ func (s *Scope) Run(c *Compile) (err error) {
 
 				s.DataSource.R = readers[0]
 				s.DataSource.R.SetOrderBy(s.DataSource.OrderBy)
-				s.DataSource.R.SetIndexParam(s.DataSource.IndexReaderParam)
+				s.DataSource.R.SetIndexParam(s.DataSource.node.GetIndexReaderParam())
 			}
 
 			var tag int32
@@ -533,7 +533,7 @@ func buildScanParallelRun(s *Scope, c *Compile) (*Scope, error) {
 	if s.NodeInfo.Mcpu == 1 {
 		s.DataSource.R = readers[0]
 		s.DataSource.R.SetOrderBy(s.DataSource.OrderBy)
-		s.DataSource.R.SetIndexParam(s.DataSource.IndexReaderParam)
+		s.DataSource.R.SetIndexParam(s.DataSource.node.GetIndexReaderParam())
 		return s, nil
 	}
 
@@ -546,7 +546,7 @@ func buildScanParallelRun(s *Scope, c *Compile) (*Scope, error) {
 			}
 		}
 
-		readers[i].SetIndexParam(s.DataSource.IndexReaderParam)
+		readers[i].SetIndexParam(s.DataSource.node.GetIndexReaderParam())
 
 		ss[i].DataSource = &Source{
 			R:            readers[i],
