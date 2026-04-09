@@ -17,6 +17,7 @@ package hashtable
 import (
 	"bytes"
 	"io"
+	"math/bits"
 	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -39,13 +40,18 @@ var StrKeyPadding [16]byte
 type StringHashMap struct {
 	mp *mpool.MPool
 
-	blockCellCnt    uint64
-	blockMaxElemCnt uint64
-	cellCntMask     uint64
+	blockCellCnt     uint64
+	blockCellCntBits uint64
+	blockMaxElemCnt  uint64
+	cellCntMask      uint64
 
 	cellCnt uint64
 	elemCnt uint64
 	cells   [][]StringHashMapCell
+
+	// grouped hints that consecutive batch elements often share the same key.
+	// When true, batch methods cache the last lookup to skip redundant findCell probes.
+	grouped bool
 }
 
 var (
@@ -57,6 +63,8 @@ func init() {
 	strCellSize = uint64(unsafe.Sizeof(StringHashMapCell{}))
 	maxStrCellCntPerBlock = maxBlockSize / strCellSize
 }
+
+func (ht *StringHashMap) SetGrouped(v bool) { ht.grouped = v }
 
 func (ht *StringHashMap) Free() {
 	for i, c := range ht.cells {
@@ -81,6 +89,7 @@ func (ht *StringHashMap) allocate(index int, ncells int) error {
 func (ht *StringHashMap) Init(mp *mpool.MPool) (err error) {
 	ht.mp = mp
 	ht.blockCellCnt = kInitialCellCnt
+	ht.blockCellCntBits = uint64(bits.TrailingZeros64(kInitialCellCnt))
 	ht.blockMaxElemCnt = maxElemCnt(kInitialCellCnt, strCellSize)
 	ht.elemCnt = 0
 	ht.cellCnt = kInitialCellCnt
@@ -101,14 +110,34 @@ func (ht *StringHashMap) InsertStringBatch(states [][3]uint64, keys [][]byte, va
 
 	BytesBatchGenHashStates(&keys[0], &states[0], len(keys))
 
-	for i := range keys {
-		cell := ht.findCell(&states[i])
-		if cell.Mapped == 0 {
-			ht.elemCnt++
-			cell.HashState = states[i]
-			cell.Mapped = ht.elemCnt
+	if ht.grouped {
+		var lastState [3]uint64
+		var lastMapped uint64
+		for i := range keys {
+			if i > 0 && states[i] == lastState {
+				values[i] = lastMapped
+				continue
+			}
+			cell := ht.findCell(&states[i])
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.HashState = states[i]
+				cell.Mapped = ht.elemCnt
+			}
+			lastState = states[i]
+			lastMapped = cell.Mapped
+			values[i] = cell.Mapped
 		}
-		values[i] = cell.Mapped
+	} else {
+		for i := range keys {
+			cell := ht.findCell(&states[i])
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.HashState = states[i]
+				cell.Mapped = ht.elemCnt
+			}
+			values[i] = cell.Mapped
+		}
 	}
 	return nil
 }
@@ -120,18 +149,42 @@ func (ht *StringHashMap) InsertStringBatchWithRing(zValues []int64, states [][3]
 
 	BytesBatchGenHashStates(&keys[0], &states[0], len(keys))
 
-	for i := range keys {
-		if zValues[i] == 0 {
-			continue
+	if ht.grouped {
+		var lastState [3]uint64
+		var lastMapped uint64
+		hasLast := false
+		for i := range keys {
+			if zValues[i] == 0 {
+				continue
+			}
+			if hasLast && states[i] == lastState {
+				values[i] = lastMapped
+				continue
+			}
+			cell := ht.findCell(&states[i])
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.HashState = states[i]
+				cell.Mapped = ht.elemCnt
+			}
+			lastState = states[i]
+			lastMapped = cell.Mapped
+			hasLast = true
+			values[i] = cell.Mapped
 		}
-
-		cell := ht.findCell(&states[i])
-		if cell.Mapped == 0 {
-			ht.elemCnt++
-			cell.HashState = states[i]
-			cell.Mapped = ht.elemCnt
+	} else {
+		for i := range keys {
+			if zValues[i] == 0 {
+				continue
+			}
+			cell := ht.findCell(&states[i])
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.HashState = states[i]
+				cell.Mapped = ht.elemCnt
+			}
+			values[i] = cell.Mapped
 		}
-		values[i] = cell.Mapped
 	}
 	return nil
 }
@@ -139,16 +192,31 @@ func (ht *StringHashMap) InsertStringBatchWithRing(zValues []int64, states [][3]
 func (ht *StringHashMap) FindStringBatch(states [][3]uint64, keys [][]byte, values []uint64) {
 	BytesBatchGenHashStates(&keys[0], &states[0], len(keys))
 
-	for i := range keys {
-		cell := ht.findCell(&states[i])
-		values[i] = cell.Mapped
+	if ht.grouped {
+		var lastState [3]uint64
+		var lastMapped uint64
+		for i := range keys {
+			if i > 0 && states[i] == lastState {
+				values[i] = lastMapped
+				continue
+			}
+			cell := ht.findCell(&states[i])
+			lastState = states[i]
+			lastMapped = cell.Mapped
+			values[i] = cell.Mapped
+		}
+	} else {
+		for i := range keys {
+			cell := ht.findCell(&states[i])
+			values[i] = cell.Mapped
+		}
 	}
 }
 
 func (ht *StringHashMap) findCell(state *[3]uint64) *StringHashMapCell {
 	for idx := state[0] & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
-		blockId := idx / ht.blockCellCnt
-		cellId := idx % ht.blockCellCnt
+		blockId := idx >> ht.blockCellCntBits
+		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
 		if cell.Mapped == 0 || cell.HashState == *state {
 			return cell
@@ -159,8 +227,8 @@ func (ht *StringHashMap) findCell(state *[3]uint64) *StringHashMapCell {
 
 func (ht *StringHashMap) findEmptyCell(state *[3]uint64) *StringHashMapCell {
 	for idx := state[0] & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
-		blockId := idx / ht.blockCellCnt
-		cellId := idx % ht.blockCellCnt
+		blockId := idx >> ht.blockCellCntBits
+		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
 		if cell.Mapped == 0 {
 			return cell
@@ -240,6 +308,7 @@ func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
 
 		if newAlloc <= maxBlockSize {
 			ht.blockCellCnt = newCellCnt
+			ht.blockCellCntBits = uint64(bits.TrailingZeros64(newCellCnt))
 			ht.blockMaxElemCnt = newMaxElemCnt
 
 			if err := ht.allocate(0, int(newCellCnt)); err != nil {
@@ -248,6 +317,7 @@ func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
 
 		} else {
 			ht.blockCellCnt = maxStrCellCntPerBlock
+			ht.blockCellCntBits = uint64(bits.TrailingZeros64(maxStrCellCntPerBlock))
 			ht.blockMaxElemCnt = maxElemCnt(ht.blockCellCnt, strCellSize)
 
 			newBlockNum := newAlloc / maxBlockSize
@@ -276,8 +346,8 @@ func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
 }
 
 func (ht *StringHashMap) Size() int64 {
-	// 88 is the origin size of StringHashMaps
-	ret := int64(88)
+	// fixed size of StringHashMap struct fields (mp pointer + 7 uint64s + slice header)
+	ret := int64(8 + 7*8 + 24)
 	for i := range ht.cells {
 		ret += int64(int(strCellSize) * len(ht.cells[i]))
 	}
@@ -295,8 +365,8 @@ func (it *StringHashMapIterator) Init(ht *StringHashMap) {
 
 func (it *StringHashMapIterator) Next() (cell *StringHashMapCell, err error) {
 	for it.pos < it.table.cellCnt {
-		blockId := it.pos / it.table.blockCellCnt
-		cellId := it.pos % it.table.blockCellCnt
+		blockId := it.pos >> it.table.blockCellCntBits
+		cellId := it.pos & (it.table.blockCellCnt - 1)
 		cell = &it.table.cells[blockId][cellId]
 		if cell.Mapped != 0 {
 			break

@@ -17,6 +17,7 @@ package hashtable
 import (
 	"bytes"
 	"io"
+	"math/bits"
 	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -32,13 +33,18 @@ type Int64HashMapCell struct {
 type Int64HashMap struct {
 	mp *mpool.MPool
 
-	blockCellCnt    uint64
-	blockMaxElemCnt uint64
-	cellCntMask     uint64
+	blockCellCnt     uint64
+	blockCellCntBits uint64 // log2(blockCellCnt); enables shift/mask instead of div/mod
+	blockMaxElemCnt  uint64
+	cellCntMask      uint64
 
 	cellCnt uint64
 	elemCnt uint64
 	cells   [][]Int64HashMapCell
+
+	// grouped hints that consecutive batch elements often share the same key.
+	// When true, batch methods cache the last lookup to skip redundant findCell probes.
+	grouped bool
 }
 
 var (
@@ -50,6 +56,8 @@ func init() {
 	intCellSize = uint64(unsafe.Sizeof(Int64HashMapCell{}))
 	maxIntCellCntPerBlock = maxBlockSize / intCellSize
 }
+
+func (ht *Int64HashMap) SetGrouped(v bool) { ht.grouped = v }
 
 func (ht *Int64HashMap) Free() {
 	for i, c := range ht.cells {
@@ -75,6 +83,7 @@ func (ht *Int64HashMap) allocate(index int, ncells int) error {
 func (ht *Int64HashMap) Init(mp *mpool.MPool) (err error) {
 	ht.mp = mp
 	ht.blockCellCnt = kInitialCellCnt
+	ht.blockCellCntBits = uint64(bits.TrailingZeros64(kInitialCellCnt))
 	ht.blockMaxElemCnt = maxElemCnt(kInitialCellCnt, intCellSize)
 	ht.cellCntMask = kInitialCellCnt - 1
 	ht.elemCnt = 0
@@ -98,14 +107,33 @@ func (ht *Int64HashMap) InsertBatch(n int, hashes []uint64, keysPtr unsafe.Point
 		Int64BatchHash(keysPtr, &hashes[0], n)
 	}
 
-	for i, hash := range hashes {
-		cell := ht.findCell(hash)
-		if cell.Mapped == 0 {
-			ht.elemCnt++
-			cell.Key = hash
-			cell.Mapped = ht.elemCnt
+	if ht.grouped {
+		var lastHash, lastMapped uint64
+		for i, hash := range hashes {
+			if i > 0 && hash == lastHash {
+				values[i] = lastMapped
+				continue
+			}
+			cell := ht.findCell(hash)
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.Key = hash
+				cell.Mapped = ht.elemCnt
+			}
+			lastHash = hash
+			lastMapped = cell.Mapped
+			values[i] = cell.Mapped
 		}
-		values[i] = cell.Mapped
+	} else {
+		for i, hash := range hashes {
+			cell := ht.findCell(hash)
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.Key = hash
+				cell.Mapped = ht.elemCnt
+			}
+			values[i] = cell.Mapped
+		}
 	}
 	return nil
 }
@@ -119,17 +147,41 @@ func (ht *Int64HashMap) InsertBatchWithRing(n int, zValues []int64, hashes []uin
 		Int64BatchHash(keysPtr, &hashes[0], n)
 	}
 
-	for i, hash := range hashes {
-		if zValues[i] == 0 {
-			continue
+	if ht.grouped {
+		var lastHash, lastMapped uint64
+		hasLast := false
+		for i, hash := range hashes {
+			if zValues[i] == 0 {
+				continue
+			}
+			if hasLast && hash == lastHash {
+				values[i] = lastMapped
+				continue
+			}
+			cell := ht.findCell(hash)
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.Key = hash
+				cell.Mapped = ht.elemCnt
+			}
+			lastHash = hash
+			lastMapped = cell.Mapped
+			hasLast = true
+			values[i] = cell.Mapped
 		}
-		cell := ht.findCell(hash)
-		if cell.Mapped == 0 {
-			ht.elemCnt++
-			cell.Key = hash
-			cell.Mapped = ht.elemCnt
+	} else {
+		for i, hash := range hashes {
+			if zValues[i] == 0 {
+				continue
+			}
+			cell := ht.findCell(hash)
+			if cell.Mapped == 0 {
+				ht.elemCnt++
+				cell.Key = hash
+				cell.Mapped = ht.elemCnt
+			}
+			values[i] = cell.Mapped
 		}
-		values[i] = cell.Mapped
 	}
 	return nil
 }
@@ -139,16 +191,30 @@ func (ht *Int64HashMap) FindBatch(n int, hashes []uint64, keysPtr unsafe.Pointer
 		Int64BatchHash(keysPtr, &hashes[0], n)
 	}
 
-	for i, hash := range hashes {
-		cell := ht.findCell(hash)
-		values[i] = cell.Mapped
+	if ht.grouped {
+		var lastHash, lastMapped uint64
+		for i, hash := range hashes {
+			if i > 0 && hash == lastHash {
+				values[i] = lastMapped
+				continue
+			}
+			cell := ht.findCell(hash)
+			lastHash = hash
+			lastMapped = cell.Mapped
+			values[i] = cell.Mapped
+		}
+	} else {
+		for i, hash := range hashes {
+			cell := ht.findCell(hash)
+			values[i] = cell.Mapped
+		}
 	}
 }
 
 func (ht *Int64HashMap) findCell(hash uint64) *Int64HashMapCell {
 	for idx := hash & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
-		blockId := idx / ht.blockCellCnt
-		cellId := idx % ht.blockCellCnt
+		blockId := idx >> ht.blockCellCntBits
+		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
 		if cell.Key == hash || cell.Mapped == 0 {
 			return cell
@@ -159,8 +225,8 @@ func (ht *Int64HashMap) findCell(hash uint64) *Int64HashMapCell {
 
 func (ht *Int64HashMap) findEmptyCell(hash uint64) *Int64HashMapCell {
 	for idx := hash & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
-		blockId := idx / ht.blockCellCnt
-		cellId := idx % ht.blockCellCnt
+		blockId := idx >> ht.blockCellCntBits
+		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
 		if cell.Mapped == 0 {
 			return cell
@@ -239,6 +305,7 @@ func (ht *Int64HashMap) ResizeOnDemand(cnt int) error {
 
 		if newAllocSize <= maxBlockSize {
 			ht.blockCellCnt = newCellCnt
+			ht.blockCellCntBits = uint64(bits.TrailingZeros64(newCellCnt))
 			ht.blockMaxElemCnt = newMaxElemCnt
 
 			if err := ht.allocate(0, int(newCellCnt)); err != nil {
@@ -247,6 +314,7 @@ func (ht *Int64HashMap) ResizeOnDemand(cnt int) error {
 
 		} else {
 			ht.blockCellCnt = maxIntCellCntPerBlock
+			ht.blockCellCntBits = uint64(bits.TrailingZeros64(maxIntCellCntPerBlock))
 			ht.blockMaxElemCnt = maxElemCnt(ht.blockCellCnt, intCellSize)
 
 			newBlockNum := newAllocSize / maxBlockSize
@@ -279,8 +347,8 @@ func (ht *Int64HashMap) Cardinality() uint64 {
 }
 
 func (ht *Int64HashMap) Size() int64 {
-	// 41 is the fixed size of Int64HashMap
-	ret := int64(41)
+	// fixed size of Int64HashMap struct fields (mp pointer + 7 uint64s + slice header)
+	ret := int64(8 + 7*8 + 24)
 	for i := range ht.cells {
 		ret += int64(len(ht.cells[i]) * int(intCellSize))
 		// 16 is the len of ht.cells[i]
@@ -300,8 +368,8 @@ func (it *Int64HashMapIterator) Init(ht *Int64HashMap) {
 
 func (it *Int64HashMapIterator) Next() (cell *Int64HashMapCell, err error) {
 	for it.pos < it.table.cellCnt {
-		blockId := it.pos / it.table.blockCellCnt
-		cellId := it.pos % it.table.blockCellCnt
+		blockId := it.pos >> it.table.blockCellCntBits
+		cellId := it.pos & (it.table.blockCellCnt - 1)
 		cell = &it.table.cells[blockId][cellId]
 		if cell.Mapped != 0 {
 			break
