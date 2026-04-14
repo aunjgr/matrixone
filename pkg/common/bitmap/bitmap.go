@@ -181,6 +181,11 @@ func (n *Bitmap) Ptr() *uint64 {
 	return &n.data[0]
 }
 
+// Data returns the raw uint64 word slice backing this bitmap.
+func (n *Bitmap) Data() []uint64 {
+	return n.data
+}
+
 // EmptyByFlag is a quick and dirty way to check if the Bitmap is empty.
 // If it retruns true, the Bitmap is empty.  Otherwise, it may or may not be empty.
 func (n *Bitmap) EmptyByFlag() bool {

@@ -38,9 +38,10 @@ type Int64HashMap struct {
 	blockMaxElemCnt  uint64
 	cellCntMask      uint64
 
-	cellCnt uint64
-	elemCnt uint64
-	cells   [][]Int64HashMapCell
+	cellCnt   uint64
+	elemCnt   uint64
+	cells     [][]Int64HashMapCell
+	fastCells []Int64HashMapCell // cells[0] when single-block; nil when multi-block
 
 	// grouped hints that consecutive batch elements often share the same key.
 	// When true, batch methods cache the last lookup to skip redundant findCell probes.
@@ -94,6 +95,7 @@ func (ht *Int64HashMap) Init(mp *mpool.MPool) (err error) {
 	if err = ht.allocate(0, int(ht.blockCellCnt)); err != nil {
 		return err
 	}
+	ht.fastCells = ht.cells[0]
 
 	return
 }
@@ -212,7 +214,16 @@ func (ht *Int64HashMap) FindBatch(n int, hashes []uint64, keysPtr unsafe.Pointer
 }
 
 func (ht *Int64HashMap) findCell(hash uint64) *Int64HashMapCell {
-	for idx := hash & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
+	idx := hash & ht.cellCntMask
+	if fc := ht.fastCells; fc != nil {
+		for ; ; idx = (idx + 1) & ht.cellCntMask {
+			cell := &fc[idx]
+			if cell.Key == hash || cell.Mapped == 0 {
+				return cell
+			}
+		}
+	}
+	for ; ; idx = (idx + 1) & ht.cellCntMask {
 		blockId := idx >> ht.blockCellCntBits
 		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
@@ -220,11 +231,19 @@ func (ht *Int64HashMap) findCell(hash uint64) *Int64HashMapCell {
 			return cell
 		}
 	}
-	return nil
 }
 
 func (ht *Int64HashMap) findEmptyCell(hash uint64) *Int64HashMapCell {
-	for idx := hash & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
+	idx := hash & ht.cellCntMask
+	if fc := ht.fastCells; fc != nil {
+		for ; ; idx = (idx + 1) & ht.cellCntMask {
+			cell := &fc[idx]
+			if cell.Mapped == 0 {
+				return cell
+			}
+		}
+	}
+	for ; ; idx = (idx + 1) & ht.cellCntMask {
 		blockId := idx >> ht.blockCellCntBits
 		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
@@ -232,7 +251,6 @@ func (ht *Int64HashMap) findEmptyCell(hash uint64) *Int64HashMapCell {
 			return cell
 		}
 	}
-	return nil
 }
 
 func (ht *Int64HashMap) ResizeOnDemand(cnt int) error {
@@ -250,7 +268,7 @@ func (ht *Int64HashMap) ResizeOnDemand(cnt int) error {
 
 	newAllocSize := int(newCellCnt * intCellSize)
 	if ht.blockCellCnt == maxIntCellCntPerBlock {
-		// double the blocks
+		// double the blocks (already multi-block, fastCells stays nil)
 		oldBlockNum := len(ht.cells)
 		newBlockNum := newAllocSize / maxBlockSize
 
@@ -298,6 +316,7 @@ func (ht *Int64HashMap) ResizeOnDemand(cnt int) error {
 	} else {
 		oldCells0 := ht.cells[0]
 		ht.cells[0] = nil
+		ht.fastCells = nil
 		defer mpool.FreeSlice(ht.mp, oldCells0)
 
 		ht.cellCnt = newCellCnt
@@ -311,6 +330,7 @@ func (ht *Int64HashMap) ResizeOnDemand(cnt int) error {
 			if err := ht.allocate(0, int(newCellCnt)); err != nil {
 				return err
 			}
+			ht.fastCells = ht.cells[0]
 
 		} else {
 			ht.blockCellCnt = maxIntCellCntPerBlock
@@ -367,14 +387,24 @@ func (it *Int64HashMapIterator) Init(ht *Int64HashMap) {
 }
 
 func (it *Int64HashMapIterator) Next() (cell *Int64HashMapCell, err error) {
-	for it.pos < it.table.cellCnt {
-		blockId := it.pos >> it.table.blockCellCntBits
-		cellId := it.pos & (it.table.blockCellCnt - 1)
-		cell = &it.table.cells[blockId][cellId]
-		if cell.Mapped != 0 {
-			break
+	if fc := it.table.fastCells; fc != nil {
+		for it.pos < it.table.cellCnt {
+			cell = &fc[it.pos]
+			if cell.Mapped != 0 {
+				break
+			}
+			it.pos++
 		}
-		it.pos++
+	} else {
+		for it.pos < it.table.cellCnt {
+			blockId := it.pos >> it.table.blockCellCntBits
+			cellId := it.pos & (it.table.blockCellCnt - 1)
+			cell = &it.table.cells[blockId][cellId]
+			if cell.Mapped != 0 {
+				break
+			}
+			it.pos++
+		}
 	}
 
 	if it.pos >= it.table.cellCnt {

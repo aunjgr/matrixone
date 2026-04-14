@@ -155,10 +155,11 @@ func fillKeys[T types.FixedSizeT](itr *intHashMapIterator, vec *vector.Vector, s
 			uint32AddScalar(size, keyOffs[:n], keyOffs[:n])
 		}
 	} else {
-		nsp := vec.GetNulls()
+		nspData := vec.GetNulls().GetBitmap().Data()
 		if itr.mp.hasNull {
 			for i := 0; i < n; i++ {
-				if nsp.Contains(uint64(i + start)) {
+				row := uint64(i + start)
+				if nspData[row>>6]&(1<<(row&0x3F)) != 0 {
 					*(*int8)(unsafe.Add(unsafe.Pointer(&keys[i]), keyOffs[i])) = 1
 					keyOffs[i]++
 				} else {
@@ -170,7 +171,8 @@ func fillKeys[T types.FixedSizeT](itr *intHashMapIterator, vec *vector.Vector, s
 			}
 		} else {
 			for i := 0; i < n; i++ {
-				if nsp.Contains(uint64(i + start)) {
+				row := uint64(i + start)
+				if nspData[row>>6]&(1<<(row&0x3F)) != 0 {
 					itr.zValues[i] = 0
 					continue
 				}
@@ -202,10 +204,11 @@ func fillVarlenaKey(itr *intHashMapIterator, vec *vector.Vector, start int, n in
 			}
 		}
 	} else {
-		nsp := vec.GetNulls()
+		nspData := vec.GetNulls().GetBitmap().Data()
 		if itr.mp.hasNull {
 			for i := 0; i < n; i++ {
-				if nsp.Contains(uint64(i + start)) {
+				row := uint64(i + start)
+				if nspData[row>>6]&(1<<(row&0x3F)) != 0 {
 					*(*int8)(unsafe.Add(unsafe.Pointer(&keys[i]), keyOffs[i])) = 1
 					keyOffs[i]++
 				} else {
@@ -217,7 +220,8 @@ func fillVarlenaKey(itr *intHashMapIterator, vec *vector.Vector, start int, n in
 			}
 		} else {
 			for i := 0; i < n; i++ {
-				if nsp.Contains(uint64(i + start)) {
+				row := uint64(i + start)
+				if nspData[row>>6]&(1<<(row&0x3F)) != 0 {
 					itr.zValues[i] = 0
 					continue
 				}
@@ -259,11 +263,12 @@ func fillStrKey(itr *intHashMapIterator, vec *vector.Vector, start int, n int) {
 			}
 		}
 	} else {
-		nsp := vec.GetNulls()
+		nspData := vec.GetNulls().GetBitmap().Data()
 		if itr.mp.hasNull {
 			for i := 0; i < n; i++ {
 				v := vec.GetBytesAt(i + start)
-				if nsp.Contains(uint64(i + start)) {
+				row := uint64(i + start)
+				if nspData[row>>6]&(1<<(row&0x3F)) != 0 {
 					*(*int8)(unsafe.Add(unsafe.Pointer(&keys[i]), keyOffs[i])) = 1
 					keyOffs[i]++
 				} else {
@@ -275,7 +280,8 @@ func fillStrKey(itr *intHashMapIterator, vec *vector.Vector, start int, n int) {
 		} else {
 			for i := 0; i < n; i++ {
 				v := vec.GetBytesAt(i + start)
-				if nsp.Contains(uint64(i + start)) {
+				row := uint64(i + start)
+				if nspData[row>>6]&(1<<(row&0x3F)) != 0 {
 					itr.zValues[i] = 0
 					continue
 				}

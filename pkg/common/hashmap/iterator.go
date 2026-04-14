@@ -78,11 +78,9 @@ func (itr *strHashmapIterator) DetectDup(vecs []*vector.Vector, row int) (bool, 
 	if err := itr.mp.hashMap.InsertStringBatch(itr.strHashStates, keys[:1], itr.values[:1]); err != nil {
 		return false, err
 	}
-	if itr.values[0] > itr.mp.rows {
-		itr.mp.rows++
-		return true, nil
-	}
-	return false, nil
+	oldRows := itr.mp.rows
+	itr.mp.rows = itr.mp.hashMap.Cardinality()
+	return itr.mp.rows > oldRows, nil
 }
 
 func (itr *strHashmapIterator) Insert(start, count int, vecs []*vector.Vector) ([]uint64, []int64, error) {
@@ -102,9 +100,8 @@ func (itr *strHashmapIterator) Insert(start, count int, vecs []*vector.Vector) (
 		err = itr.mp.hashMap.InsertStringBatchWithRing(itr.zValues, itr.strHashStates, itr.keys[:count], itr.values)
 	}
 
-	vs, zvs := itr.values[:count], itr.zValues[:count]
-	updateHashTableRows(itr.mp, vs, zvs)
-	return vs, zvs, err
+	itr.mp.rows = itr.mp.hashMap.Cardinality()
+	return itr.values[:count], itr.zValues[:count], err
 }
 
 func (itr *intHashMapIterator) Find(start, count int, vecs []*vector.Vector) ([]uint64, []int64) {
@@ -142,29 +139,6 @@ func (itr *intHashMapIterator) Insert(start, count int, vecs []*vector.Vector) (
 	} else {
 		err = itr.mp.hashMap.InsertBatchWithRing(count, itr.zValues, itr.hashes[:count], unsafe.Pointer(&itr.keys[0]), itr.values)
 	}
-	vs, zvs := itr.values[:count], itr.zValues[:count]
-	updateHashTableRows(itr.mp, vs, zvs)
-	return vs, zvs, err
-}
-
-func updateHashTableRows(hashMap HashMap, vs []uint64, zvs []int64) {
-	groupCount := hashMap.GroupCount()
-	if hashMap.HasNull() {
-		for _, v := range vs {
-			if v > groupCount {
-				groupCount++
-			}
-		}
-	} else {
-		for i, v := range vs {
-			if zvs[i] == 0 {
-				continue
-			}
-			if v > groupCount {
-				groupCount++
-			}
-		}
-	}
-	count := groupCount - hashMap.GroupCount()
-	hashMap.AddGroups(count)
+	itr.mp.rows = itr.mp.hashMap.Cardinality()
+	return itr.values[:count], itr.zValues[:count], err
 }

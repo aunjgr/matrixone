@@ -45,9 +45,10 @@ type StringHashMap struct {
 	blockMaxElemCnt  uint64
 	cellCntMask      uint64
 
-	cellCnt uint64
-	elemCnt uint64
-	cells   [][]StringHashMapCell
+	cellCnt   uint64
+	elemCnt   uint64
+	cells     [][]StringHashMapCell
+	fastCells []StringHashMapCell // cells[0] when single-block; nil when multi-block
 
 	// grouped hints that consecutive batch elements often share the same key.
 	// When true, batch methods cache the last lookup to skip redundant findCell probes.
@@ -99,6 +100,7 @@ func (ht *StringHashMap) Init(mp *mpool.MPool) (err error) {
 	if err := ht.allocate(0, int(ht.blockCellCnt)); err != nil {
 		return err
 	}
+	ht.fastCells = ht.cells[0]
 
 	return
 }
@@ -214,7 +216,16 @@ func (ht *StringHashMap) FindStringBatch(states [][3]uint64, keys [][]byte, valu
 }
 
 func (ht *StringHashMap) findCell(state *[3]uint64) *StringHashMapCell {
-	for idx := state[0] & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
+	idx := state[0] & ht.cellCntMask
+	if fc := ht.fastCells; fc != nil {
+		for ; ; idx = (idx + 1) & ht.cellCntMask {
+			cell := &fc[idx]
+			if cell.Mapped == 0 || cell.HashState == *state {
+				return cell
+			}
+		}
+	}
+	for ; ; idx = (idx + 1) & ht.cellCntMask {
 		blockId := idx >> ht.blockCellCntBits
 		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
@@ -222,11 +233,19 @@ func (ht *StringHashMap) findCell(state *[3]uint64) *StringHashMapCell {
 			return cell
 		}
 	}
-	return nil
 }
 
 func (ht *StringHashMap) findEmptyCell(state *[3]uint64) *StringHashMapCell {
-	for idx := state[0] & ht.cellCntMask; true; idx = (idx + 1) & ht.cellCntMask {
+	idx := state[0] & ht.cellCntMask
+	if fc := ht.fastCells; fc != nil {
+		for ; ; idx = (idx + 1) & ht.cellCntMask {
+			cell := &fc[idx]
+			if cell.Mapped == 0 {
+				return cell
+			}
+		}
+	}
+	for ; ; idx = (idx + 1) & ht.cellCntMask {
 		blockId := idx >> ht.blockCellCntBits
 		cellId := idx & (ht.blockCellCnt - 1)
 		cell := &ht.cells[blockId][cellId]
@@ -234,7 +253,6 @@ func (ht *StringHashMap) findEmptyCell(state *[3]uint64) *StringHashMapCell {
 			return cell
 		}
 	}
-	return nil
 }
 
 func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
@@ -301,6 +319,7 @@ func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
 	} else {
 		oldCells0 := ht.cells[0]
 		ht.cells[0] = nil
+		ht.fastCells = nil
 		defer mpool.FreeSlice(ht.mp, oldCells0)
 
 		ht.cellCnt = newCellCnt
@@ -314,6 +333,7 @@ func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
 			if err := ht.allocate(0, int(newCellCnt)); err != nil {
 				return err
 			}
+			ht.fastCells = ht.cells[0]
 
 		} else {
 			ht.blockCellCnt = maxStrCellCntPerBlock
@@ -345,6 +365,10 @@ func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
 	return nil
 }
 
+func (ht *StringHashMap) Cardinality() uint64 {
+	return ht.elemCnt
+}
+
 func (ht *StringHashMap) Size() int64 {
 	// fixed size of StringHashMap struct fields (mp pointer + 7 uint64s + slice header)
 	ret := int64(8 + 7*8 + 24)
@@ -364,14 +388,24 @@ func (it *StringHashMapIterator) Init(ht *StringHashMap) {
 }
 
 func (it *StringHashMapIterator) Next() (cell *StringHashMapCell, err error) {
-	for it.pos < it.table.cellCnt {
-		blockId := it.pos >> it.table.blockCellCntBits
-		cellId := it.pos & (it.table.blockCellCnt - 1)
-		cell = &it.table.cells[blockId][cellId]
-		if cell.Mapped != 0 {
-			break
+	if fc := it.table.fastCells; fc != nil {
+		for it.pos < it.table.cellCnt {
+			cell = &fc[it.pos]
+			if cell.Mapped != 0 {
+				break
+			}
+			it.pos++
 		}
-		it.pos++
+	} else {
+		for it.pos < it.table.cellCnt {
+			blockId := it.pos >> it.table.blockCellCntBits
+			cellId := it.pos & (it.table.blockCellCnt - 1)
+			cell = &it.table.cells[blockId][cellId]
+			if cell.Mapped != 0 {
+				break
+			}
+			it.pos++
+		}
 	}
 
 	if it.pos >= it.table.cellCnt {

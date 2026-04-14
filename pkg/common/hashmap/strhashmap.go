@@ -48,11 +48,20 @@ func NewStrHashMap(hasNull bool, memPool *mpool.MPool) (*StrHashMap, error) {
 }
 
 func (m *StrHashMap) NewIterator() Iterator {
+	// Pre-allocate a contiguous backing array for all key buffers to avoid
+	// per-key allocations on the first batch.
+	const initialKeyCapacity = 64
+	backing := make([]byte, UnitLimit*initialKeyCapacity)
+	keys := make([][]byte, UnitLimit)
+	for i := range keys {
+		off := i * initialKeyCapacity
+		keys[i] = backing[off : off : off+initialKeyCapacity]
+	}
 	return &strHashmapIterator{
 		mp:            m,
 		values:        make([]uint64, UnitLimit),
 		zValues:       make([]int64, UnitLimit),
-		keys:          make([][]byte, UnitLimit),
+		keys:          keys,
 		strHashStates: make([][3]uint64, UnitLimit),
 	}
 }
@@ -87,6 +96,10 @@ func (m *StrHashMap) Size() int64 {
 		return 0
 	}
 	return m.hashMap.Size()
+}
+
+func (m *StrHashMap) Cardinality() uint64 {
+	return m.hashMap.Cardinality()
 }
 
 func (itr *strHashmapIterator) encodeHashKeys(vecs []*vector.Vector, start, count int) {
@@ -233,12 +246,13 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 			}
 		}
 	} else {
-		nsp := vec.GetNulls()
+		nspData := vec.GetNulls().GetBitmap().Data()
 		rsp := vec.GetGrouping()
 		va, area := vector.MustVarlenaRawData(vec)
 		if area == nil {
 			for i := 0; i < lenV; i++ {
-				hasNull := nsp.Contains(uint64(i + start))
+				row := uint64(i + start)
+				hasNull := nspData[row>>6]&(1<<(row&0x3F)) != 0
 				hasGrouping := rsp.Contains(uint64(i + start))
 				if itr.mp.hasNull {
 					if hasGrouping {
@@ -247,13 +261,9 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 						keys[i] = append(keys[i], byte(1))
 					} else {
 						bytes := va[i+start].ByteSlice()
-						// for "a"，"bc" and "ab","c", we need to distinct
-						// this is not null value
 						keys[i] = append(keys[i], 0)
-						// give the length
 						length := uint16(len(bytes))
 						keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-						// append the pure value bytes
 						keys[i] = append(keys[i], bytes...)
 					}
 				} else {
@@ -262,17 +272,15 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 						continue
 					}
 					bytes := va[i+start].ByteSlice()
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// give the length
 					length := uint16(len(bytes))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
 					keys[i] = append(keys[i], bytes...)
 				}
 			}
 		} else {
 			for i := 0; i < lenV; i++ {
-				hasNull := nsp.Contains(uint64(i + start))
+				row := uint64(i + start)
+				hasNull := nspData[row>>6]&(1<<(row&0x3F)) != 0
 				hasGrouping := rsp.Contains(uint64(i + start))
 				if itr.mp.hasNull {
 					if hasGrouping {
@@ -281,13 +289,9 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 						keys[i] = append(keys[i], byte(1))
 					} else {
 						bytes := va[i+start].GetByteSlice(area)
-						// for "a"，"bc" and "ab","c", we need to distinct
-						// this is not null value
 						keys[i] = append(keys[i], 0)
-						// give the length
 						length := uint16(len(bytes))
 						keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-						// append the pure value bytes
 						keys[i] = append(keys[i], bytes...)
 					}
 				} else {
@@ -296,11 +300,8 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 						continue
 					}
 					bytes := va[i+start].GetByteSlice(area)
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// give the length
 					length := uint16(len(bytes))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
 					keys[i] = append(keys[i], bytes...)
 				}
 			}
@@ -357,10 +358,11 @@ func fillGroupStr(itr *strHashmapIterator, vec *vector.Vector, n int, sz int, st
 			}
 		}
 	} else {
-		nsp := vec.GetNulls()
+		nspData := vec.GetNulls().GetBitmap().Data()
 		gsp := vec.GetGrouping()
 		for i := 0; i < n; i++ {
-			isNull := nsp.Contains(uint64(i + start))
+			row := uint64(i + start)
+			isNull := nspData[row>>6]&(1<<(row&0x3F)) != 0
 			isGrouping := gsp.Contains(uint64(i + start))
 			if itr.mp.hasNull {
 				if isGrouping {
