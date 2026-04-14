@@ -109,9 +109,27 @@ func (ht *Int64HashMap) InsertBatch(n int, hashes []uint64, keysPtr unsafe.Point
 		Int64BatchHash(keysPtr, &hashes[0], n)
 	}
 
+	// Prefetch only works in single-block mode (fastCells != nil).
+	// Multi-block has non-contiguous cell arrays that can't be prefetched with a single base pointer.
+	var cellBase unsafe.Pointer
+	var mask uint64
+	pf := PrefetchInt64Cells
+	if fc := ht.fastCells; pf != nil && fc != nil {
+		cellBase = unsafe.Pointer(&fc[0])
+		mask = ht.cellCntMask
+		pf(&hashes[0], min(prefetchAhead, n), cellBase, mask)
+	} else {
+		pf = nil
+	}
+
 	if ht.grouped {
 		var lastHash, lastMapped uint64
 		for i, hash := range hashes {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&hashes[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if i > 0 && hash == lastHash {
 				values[i] = lastMapped
 				continue
@@ -128,6 +146,11 @@ func (ht *Int64HashMap) InsertBatch(n int, hashes []uint64, keysPtr unsafe.Point
 		}
 	} else {
 		for i, hash := range hashes {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&hashes[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			cell := ht.findCell(hash)
 			if cell.Mapped == 0 {
 				ht.elemCnt++
@@ -149,10 +172,26 @@ func (ht *Int64HashMap) InsertBatchWithRing(n int, zValues []int64, hashes []uin
 		Int64BatchHash(keysPtr, &hashes[0], n)
 	}
 
+	var cellBase unsafe.Pointer
+	var mask uint64
+	pf := PrefetchInt64Cells
+	if fc := ht.fastCells; pf != nil && fc != nil {
+		cellBase = unsafe.Pointer(&fc[0])
+		mask = ht.cellCntMask
+		pf(&hashes[0], min(prefetchAhead, n), cellBase, mask)
+	} else {
+		pf = nil
+	}
+
 	if ht.grouped {
 		var lastHash, lastMapped uint64
 		hasLast := false
 		for i, hash := range hashes {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&hashes[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if zValues[i] == 0 {
 				continue
 			}
@@ -173,6 +212,11 @@ func (ht *Int64HashMap) InsertBatchWithRing(n int, zValues []int64, hashes []uin
 		}
 	} else {
 		for i, hash := range hashes {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&hashes[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if zValues[i] == 0 {
 				continue
 			}
@@ -193,9 +237,25 @@ func (ht *Int64HashMap) FindBatch(n int, hashes []uint64, keysPtr unsafe.Pointer
 		Int64BatchHash(keysPtr, &hashes[0], n)
 	}
 
+	var cellBase unsafe.Pointer
+	var mask uint64
+	pf := PrefetchInt64Cells
+	if fc := ht.fastCells; pf != nil && fc != nil {
+		cellBase = unsafe.Pointer(&fc[0])
+		mask = ht.cellCntMask
+		pf(&hashes[0], min(prefetchAhead, n), cellBase, mask)
+	} else {
+		pf = nil
+	}
+
 	if ht.grouped {
 		var lastHash, lastMapped uint64
 		for i, hash := range hashes {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&hashes[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if i > 0 && hash == lastHash {
 				values[i] = lastMapped
 				continue
@@ -207,6 +267,11 @@ func (ht *Int64HashMap) FindBatch(n int, hashes []uint64, keysPtr unsafe.Pointer
 		}
 	} else {
 		for i, hash := range hashes {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&hashes[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			cell := ht.findCell(hash)
 			values[i] = cell.Mapped
 		}
@@ -350,7 +415,23 @@ func (ht *Int64HashMap) ResizeOnDemand(cnt int) error {
 		}
 
 		// rearrange the cells
+		pf := PrefetchRehashInt64Cells
+		var cellBase unsafe.Pointer
+		if fc := ht.fastCells; pf != nil && fc != nil {
+			cellBase = unsafe.Pointer(&fc[0])
+		} else {
+			pf = nil
+		}
+		mask := ht.cellCntMask
+		if pf != nil {
+			pf(&oldCells0[0], min(prefetchAhead, len(oldCells0)), cellBase, mask)
+		}
 		for i := range oldCells0 {
+			if pf != nil && i > 0 && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < len(oldCells0) {
+					pf(&oldCells0[pfStart], min(prefetchAhead, len(oldCells0)-pfStart), cellBase, mask)
+				}
+			}
 			cell := &oldCells0[i]
 			if cell.Mapped != 0 {
 				newCell := ht.findEmptyCell(cell.Key)

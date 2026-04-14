@@ -28,7 +28,17 @@ func aesInt192BatchGenHashStates(data *[3]uint64, states *[3]uint64, length int)
 func aesInt256BatchGenHashStates(data *[4]uint64, states *[3]uint64, length int)
 func aesInt320BatchGenHashStates(data *[5]uint64, states *[3]uint64, length int)
 
+func prefetchInt64Cells(hashes *uint64, count int, cellBase unsafe.Pointer, mask uint64)
+func prefetchStringCells(states *[3]uint64, count int, cellBase unsafe.Pointer, mask uint64)
+func prefetchRehashInt64Cells(cells *Int64HashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
+func prefetchRehashStringCells(cells *StringHashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
+
 func init() {
+	PrefetchInt64Cells = prefetchInt64Cells
+	PrefetchStringCells = prefetchStringCells
+	PrefetchRehashInt64Cells = prefetchRehashInt64Cells
+	PrefetchRehashStringCells = prefetchRehashStringCells
+
 	if cpu.ARM64.HasCRC32 || (runtime.GOARCH == "arm64" && runtime.GOOS == "darwin") {
 		Int64BatchHash = crc32Int64BatchHash
 	}

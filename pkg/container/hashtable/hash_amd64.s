@@ -621,3 +621,143 @@ TEXT genCryptedPi(SB), NOSPLIT, $0-8
 	VMOVDQU X7, 0x70(DI)
 
 	RET
+
+////////////////////////////////////////////////////////////////
+// Software prefetch functions for batch hash probing
+////////////////////////////////////////////////////////////////
+
+// func prefetchInt64Cells(hashes *uint64, count int, cellBase unsafe.Pointer, mask uint64)
+// For each hash: PREFETCHT0 at cellBase + ((hash & mask) << 4).
+TEXT ·prefetchInt64Cells(SB), NOSPLIT, $0-32
+	MOVQ hashes+0(FP), SI
+	MOVQ count+8(FP), CX
+	MOVQ cellBase+16(FP), DI
+	MOVQ mask+24(FP), R8
+
+pf64_loop8:
+	SUBQ $8, CX
+	JL   pf64_tail
+
+	MOVQ 0x00(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x08(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x10(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x18(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x20(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x28(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x30(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x38(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+
+	ADDQ $0x40, SI
+	JMP  pf64_loop8
+
+pf64_tail:
+	ADDQ $8, CX
+	JE   pf64_done
+pf64_tailLoop:
+	MOVQ (SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	ADDQ $8, SI
+	LOOP pf64_tailLoop
+pf64_done:
+	RET
+
+// func prefetchStringCells(states *[3]uint64, count int, cellBase unsafe.Pointer, mask uint64)
+// Uses state[0] (stride 24 bytes). PREFETCHT0 at cellBase + ((state[0] & mask) << 5).
+TEXT ·prefetchStringCells(SB), NOSPLIT, $0-32
+	MOVQ states+0(FP), SI
+	MOVQ count+8(FP), CX
+	MOVQ cellBase+16(FP), DI
+	MOVQ mask+24(FP), R8
+
+pfstr_loop8:
+	SUBQ $8, CX
+	JL   pfstr_tail
+
+	MOVQ 0x00(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x18(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x30(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x48(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x60(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x78(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x90(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0xa8(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+
+	ADDQ $0xc0, SI
+	JMP  pfstr_loop8
+
+pfstr_tail:
+	ADDQ $8, CX
+	JE   pfstr_done
+pfstr_tailLoop:
+	MOVQ (SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	ADDQ $0x18, SI
+	LOOP pfstr_tailLoop
+pfstr_done:
+	RET
+
+// func prefetchRehashInt64Cells(cells *Int64HashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
+// Reads Key from each 16-byte cell, prefetches target slot in new table.
+TEXT ·prefetchRehashInt64Cells(SB), NOSPLIT, $0-32
+	MOVQ cells+0(FP), SI
+	MOVQ count+8(FP), CX
+	MOVQ cellBase+16(FP), DI
+	MOVQ mask+24(FP), R8
+
+rhi64_loop8:
+	SUBQ $8, CX
+	JL   rhi64_tail
+
+	MOVQ 0x00(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x10(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x20(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x30(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x40(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x50(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x60(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x70(SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+
+	ADDQ $0x80, SI
+	JMP  rhi64_loop8
+
+rhi64_tail:
+	ADDQ $8, CX
+	JE   rhi64_done
+rhi64_tailLoop:
+	MOVQ (SI), AX; ANDQ R8, AX; SHLQ $4, AX; PREFETCHT0 (DI)(AX*1)
+	ADDQ $0x10, SI
+	LOOP rhi64_tailLoop
+rhi64_done:
+	RET
+
+// func prefetchRehashStringCells(cells *StringHashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
+// Reads HashState[0] from each 32-byte cell, prefetches target slot in new table.
+TEXT ·prefetchRehashStringCells(SB), NOSPLIT, $0-32
+	MOVQ cells+0(FP), SI
+	MOVQ count+8(FP), CX
+	MOVQ cellBase+16(FP), DI
+	MOVQ mask+24(FP), R8
+
+rhstr_loop8:
+	SUBQ $8, CX
+	JL   rhstr_tail
+
+	MOVQ 0x000(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x020(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x040(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x060(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x080(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x0a0(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x0c0(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	MOVQ 0x0e0(SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+
+	ADDQ $0x100, SI
+	JMP  rhstr_loop8
+
+rhstr_tail:
+	ADDQ $8, CX
+	JE   rhstr_done
+rhstr_tailLoop:
+	MOVQ (SI), AX; ANDQ R8, AX; SHLQ $5, AX; PREFETCHT0 (DI)(AX*1)
+	ADDQ $0x20, SI
+	LOOP rhstr_tailLoop
+rhstr_done:
+	RET

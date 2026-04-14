@@ -30,6 +30,12 @@ var (
 	Int192BatchGenHashStates        = wyhashInt192Batch
 	Int256BatchGenHashStates        = wyhashInt256Batch
 	Int320BatchGenHashStates        = wyhashInt320Batch
+
+	// Prefetch functions — nil by default, set on architectures that support them.
+	PrefetchInt64Cells        func(hashes *uint64, count int, cellBase unsafe.Pointer, mask uint64)
+	PrefetchStringCells       func(states *[3]uint64, count int, cellBase unsafe.Pointer, mask uint64)
+	PrefetchRehashInt64Cells  func(cells *Int64HashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
+	PrefetchRehashStringCells func(cells *StringHashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
 )
 
 // Hashing algorithm inspired by

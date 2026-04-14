@@ -522,3 +522,165 @@ loop:
 
 done:
 	RET
+
+////////////////////////////////////////////////////////////////
+// Software prefetch functions for batch hash probing
+////////////////////////////////////////////////////////////////
+
+// func prefetchInt64Cells(hashes *uint64, count int, cellBase unsafe.Pointer, mask uint64)
+// For each hash: PRFM PLDL1KEEP at cellBase + ((hash & mask) << 4).
+TEXT ·prefetchInt64Cells(SB), NOSPLIT, $0-32
+	MOVD hashes+0(FP), R0
+	MOVD count+8(FP), R1
+	MOVD cellBase+16(FP), R2
+	MOVD mask+24(FP), R3
+
+pf64_loop8:
+	SUBS $8, R1
+	BLT  pf64_tail
+
+	LDP  0(R0), (R4, R5)
+	LDP  16(R0), (R6, R7)
+	LDP  32(R0), (R8, R9)
+	LDP  48(R0), (R10, R11)
+	ADD  $64, R0
+
+	AND R3, R4;  LSL $4, R4;  ADD R2, R4;  PRFM (R4)
+	AND R3, R5;  LSL $4, R5;  ADD R2, R5;  PRFM (R5)
+	AND R3, R6;  LSL $4, R6;  ADD R2, R6;  PRFM (R6)
+	AND R3, R7;  LSL $4, R7;  ADD R2, R7;  PRFM (R7)
+	AND R3, R8;  LSL $4, R8;  ADD R2, R8;  PRFM (R8)
+	AND R3, R9;  LSL $4, R9;  ADD R2, R9;  PRFM (R9)
+	AND R3, R10; LSL $4, R10; ADD R2, R10; PRFM (R10)
+	AND R3, R11; LSL $4, R11; ADD R2, R11; PRFM (R11)
+
+	B pf64_loop8
+
+pf64_tail:
+	ADDS $8, R1
+	BEQ  pf64_done
+pf64_tailLoop:
+	MOVD (R0), R4
+	ADD  $8, R0
+	AND R3, R4; LSL $4, R4; ADD R2, R4; PRFM (R4)
+	SUBS $1, R1
+	BNE  pf64_tailLoop
+pf64_done:
+	RET
+
+// func prefetchStringCells(states *[3]uint64, count int, cellBase unsafe.Pointer, mask uint64)
+// Uses state[0] (stride 24 bytes). PRFM PLDL1KEEP at cellBase + ((state[0] & mask) << 5).
+TEXT ·prefetchStringCells(SB), NOSPLIT, $0-32
+	MOVD states+0(FP), R0
+	MOVD count+8(FP), R1
+	MOVD cellBase+16(FP), R2
+	MOVD mask+24(FP), R3
+
+pfstr_loop8:
+	SUBS $8, R1
+	BLT  pfstr_tail
+
+	MOVD 0(R0), R4;   MOVD 24(R0), R5;  MOVD 48(R0), R6;  MOVD 72(R0), R7
+	MOVD 96(R0), R8;  MOVD 120(R0), R9; MOVD 144(R0), R10; MOVD 168(R0), R11
+	ADD  $192, R0
+
+	AND R3, R4;  LSL $5, R4;  ADD R2, R4;  PRFM (R4)
+	AND R3, R5;  LSL $5, R5;  ADD R2, R5;  PRFM (R5)
+	AND R3, R6;  LSL $5, R6;  ADD R2, R6;  PRFM (R6)
+	AND R3, R7;  LSL $5, R7;  ADD R2, R7;  PRFM (R7)
+	AND R3, R8;  LSL $5, R8;  ADD R2, R8;  PRFM (R8)
+	AND R3, R9;  LSL $5, R9;  ADD R2, R9;  PRFM (R9)
+	AND R3, R10; LSL $5, R10; ADD R2, R10; PRFM (R10)
+	AND R3, R11; LSL $5, R11; ADD R2, R11; PRFM (R11)
+
+	B pfstr_loop8
+
+pfstr_tail:
+	ADDS $8, R1
+	BEQ  pfstr_done
+pfstr_tailLoop:
+	MOVD (R0), R4
+	ADD  $24, R0
+	AND R3, R4; LSL $5, R4; ADD R2, R4; PRFM (R4)
+	SUBS $1, R1
+	BNE  pfstr_tailLoop
+pfstr_done:
+	RET
+
+// func prefetchRehashInt64Cells(cells *Int64HashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
+// Reads Key from each 16-byte cell, prefetches target slot in new table.
+TEXT ·prefetchRehashInt64Cells(SB), NOSPLIT, $0-32
+	MOVD cells+0(FP), R0
+	MOVD count+8(FP), R1
+	MOVD cellBase+16(FP), R2
+	MOVD mask+24(FP), R3
+
+rhi64_loop8:
+	SUBS $8, R1
+	BLT  rhi64_tail
+
+	MOVD 0(R0), R4;  MOVD 16(R0), R5;  MOVD 32(R0), R6;  MOVD 48(R0), R7
+	MOVD 64(R0), R8; MOVD 80(R0), R9;  MOVD 96(R0), R10; MOVD 112(R0), R11
+	ADD  $128, R0
+
+	AND R3, R4;  LSL $4, R4;  ADD R2, R4;  PRFM (R4)
+	AND R3, R5;  LSL $4, R5;  ADD R2, R5;  PRFM (R5)
+	AND R3, R6;  LSL $4, R6;  ADD R2, R6;  PRFM (R6)
+	AND R3, R7;  LSL $4, R7;  ADD R2, R7;  PRFM (R7)
+	AND R3, R8;  LSL $4, R8;  ADD R2, R8;  PRFM (R8)
+	AND R3, R9;  LSL $4, R9;  ADD R2, R9;  PRFM (R9)
+	AND R3, R10; LSL $4, R10; ADD R2, R10; PRFM (R10)
+	AND R3, R11; LSL $4, R11; ADD R2, R11; PRFM (R11)
+
+	B rhi64_loop8
+
+rhi64_tail:
+	ADDS $8, R1
+	BEQ  rhi64_done
+rhi64_tailLoop:
+	MOVD (R0), R4
+	ADD  $16, R0
+	AND R3, R4; LSL $4, R4; ADD R2, R4; PRFM (R4)
+	SUBS $1, R1
+	BNE  rhi64_tailLoop
+rhi64_done:
+	RET
+
+// func prefetchRehashStringCells(cells *StringHashMapCell, count int, cellBase unsafe.Pointer, mask uint64)
+// Reads HashState[0] from each 32-byte cell, prefetches target slot in new table.
+TEXT ·prefetchRehashStringCells(SB), NOSPLIT, $0-32
+	MOVD cells+0(FP), R0
+	MOVD count+8(FP), R1
+	MOVD cellBase+16(FP), R2
+	MOVD mask+24(FP), R3
+
+rhstr_loop8:
+	SUBS $8, R1
+	BLT  rhstr_tail
+
+	MOVD 0(R0), R4;   MOVD 32(R0), R5;  MOVD 64(R0), R6;  MOVD 96(R0), R7
+	MOVD 128(R0), R8; MOVD 160(R0), R9; MOVD 192(R0), R10; MOVD 224(R0), R11
+	ADD  $256, R0
+
+	AND R3, R4;  LSL $5, R4;  ADD R2, R4;  PRFM (R4)
+	AND R3, R5;  LSL $5, R5;  ADD R2, R5;  PRFM (R5)
+	AND R3, R6;  LSL $5, R6;  ADD R2, R6;  PRFM (R6)
+	AND R3, R7;  LSL $5, R7;  ADD R2, R7;  PRFM (R7)
+	AND R3, R8;  LSL $5, R8;  ADD R2, R8;  PRFM (R8)
+	AND R3, R9;  LSL $5, R9;  ADD R2, R9;  PRFM (R9)
+	AND R3, R10; LSL $5, R10; ADD R2, R10; PRFM (R10)
+	AND R3, R11; LSL $5, R11; ADD R2, R11; PRFM (R11)
+
+	B rhstr_loop8
+
+rhstr_tail:
+	ADDS $8, R1
+	BEQ  rhstr_done
+rhstr_tailLoop:
+	MOVD (R0), R4
+	ADD  $32, R0
+	AND R3, R4; LSL $5, R4; ADD R2, R4; PRFM (R4)
+	SUBS $1, R1
+	BNE  rhstr_tailLoop
+rhstr_done:
+	RET

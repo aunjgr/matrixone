@@ -106,16 +106,33 @@ func (ht *StringHashMap) Init(mp *mpool.MPool) (err error) {
 }
 
 func (ht *StringHashMap) InsertStringBatch(states [][3]uint64, keys [][]byte, values []uint64) error {
-	if err := ht.ResizeOnDemand(uint64(len(keys))); err != nil {
+	n := len(keys)
+	if err := ht.ResizeOnDemand(uint64(n)); err != nil {
 		return err
 	}
 
-	BytesBatchGenHashStates(&keys[0], &states[0], len(keys))
+	BytesBatchGenHashStates(&keys[0], &states[0], n)
+
+	var cellBase unsafe.Pointer
+	var mask uint64
+	pf := PrefetchStringCells
+	if fc := ht.fastCells; pf != nil && fc != nil {
+		cellBase = unsafe.Pointer(&fc[0])
+		mask = ht.cellCntMask
+		pf(&states[0], min(prefetchAhead, n), cellBase, mask)
+	} else {
+		pf = nil
+	}
 
 	if ht.grouped {
 		var lastState [3]uint64
 		var lastMapped uint64
 		for i := range keys {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&states[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if i > 0 && states[i] == lastState {
 				values[i] = lastMapped
 				continue
@@ -132,6 +149,11 @@ func (ht *StringHashMap) InsertStringBatch(states [][3]uint64, keys [][]byte, va
 		}
 	} else {
 		for i := range keys {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&states[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			cell := ht.findCell(&states[i])
 			if cell.Mapped == 0 {
 				ht.elemCnt++
@@ -145,17 +167,34 @@ func (ht *StringHashMap) InsertStringBatch(states [][3]uint64, keys [][]byte, va
 }
 
 func (ht *StringHashMap) InsertStringBatchWithRing(zValues []int64, states [][3]uint64, keys [][]byte, values []uint64) error {
-	if err := ht.ResizeOnDemand(uint64(len(keys))); err != nil {
+	n := len(keys)
+	if err := ht.ResizeOnDemand(uint64(n)); err != nil {
 		return err
 	}
 
-	BytesBatchGenHashStates(&keys[0], &states[0], len(keys))
+	BytesBatchGenHashStates(&keys[0], &states[0], n)
+
+	var cellBase unsafe.Pointer
+	var mask uint64
+	pf := PrefetchStringCells
+	if fc := ht.fastCells; pf != nil && fc != nil {
+		cellBase = unsafe.Pointer(&fc[0])
+		mask = ht.cellCntMask
+		pf(&states[0], min(prefetchAhead, n), cellBase, mask)
+	} else {
+		pf = nil
+	}
 
 	if ht.grouped {
 		var lastState [3]uint64
 		var lastMapped uint64
 		hasLast := false
 		for i := range keys {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&states[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if zValues[i] == 0 {
 				continue
 			}
@@ -176,6 +215,11 @@ func (ht *StringHashMap) InsertStringBatchWithRing(zValues []int64, states [][3]
 		}
 	} else {
 		for i := range keys {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&states[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if zValues[i] == 0 {
 				continue
 			}
@@ -192,12 +236,29 @@ func (ht *StringHashMap) InsertStringBatchWithRing(zValues []int64, states [][3]
 }
 
 func (ht *StringHashMap) FindStringBatch(states [][3]uint64, keys [][]byte, values []uint64) {
-	BytesBatchGenHashStates(&keys[0], &states[0], len(keys))
+	n := len(keys)
+	BytesBatchGenHashStates(&keys[0], &states[0], n)
+
+	var cellBase unsafe.Pointer
+	var mask uint64
+	pf := PrefetchStringCells
+	if fc := ht.fastCells; pf != nil && fc != nil {
+		cellBase = unsafe.Pointer(&fc[0])
+		mask = ht.cellCntMask
+		pf(&states[0], min(prefetchAhead, n), cellBase, mask)
+	} else {
+		pf = nil
+	}
 
 	if ht.grouped {
 		var lastState [3]uint64
 		var lastMapped uint64
 		for i := range keys {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&states[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			if i > 0 && states[i] == lastState {
 				values[i] = lastMapped
 				continue
@@ -209,6 +270,11 @@ func (ht *StringHashMap) FindStringBatch(states [][3]uint64, keys [][]byte, valu
 		}
 	} else {
 		for i := range keys {
+			if pf != nil && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < n {
+					pf(&states[pfStart], min(prefetchAhead, n-pfStart), cellBase, mask)
+				}
+			}
 			cell := ht.findCell(&states[i])
 			values[i] = cell.Mapped
 		}
@@ -353,7 +419,23 @@ func (ht *StringHashMap) ResizeOnDemand(n uint64) error {
 		}
 
 		// rearrange the cells
+		pf := PrefetchRehashStringCells
+		var cellBase unsafe.Pointer
+		if fc := ht.fastCells; pf != nil && fc != nil {
+			cellBase = unsafe.Pointer(&fc[0])
+		} else {
+			pf = nil
+		}
+		mask := ht.cellCntMask
+		if pf != nil {
+			pf(&oldCells0[0], min(prefetchAhead, len(oldCells0)), cellBase, mask)
+		}
 		for i := range oldCells0 {
+			if pf != nil && i > 0 && i&(prefetchAhead-1) == 0 {
+				if pfStart := i + prefetchAhead; pfStart < len(oldCells0) {
+					pf(&oldCells0[pfStart], min(prefetchAhead, len(oldCells0)-pfStart), cellBase, mask)
+				}
+			}
 			cell := &oldCells0[i]
 			if cell.Mapped != 0 {
 				newCell := ht.findEmptyCell(&cell.HashState)

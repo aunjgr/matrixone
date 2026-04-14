@@ -23,6 +23,7 @@ const (
 	kInitialCellCnt     = 1 << kInitialCellCntBits
 	maxBlockSize        = 256 * (1 << 20)
 	MB                  = 1 << 20
+	prefetchAhead       = 16
 )
 
 func maxElemCnt(cellCnt, cellSize uint64) uint64 {
