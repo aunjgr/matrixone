@@ -545,7 +545,8 @@ func decimalStateAddUnchecked[S sumAvgDecimalState](left, right S) S {
 
 type sumAvgDecExec[A sumAvgDecimalArg, S sumAvgDecimalState] struct {
 	aggExec
-	isSum bool
+	isSum            bool
+	localAddSafe     bool // true when state type is wider than arg type (overflow impossible in local buffer)
 }
 
 func (exec *sumAvgDecExec[A, S]) Fill(groupIndex int, row int, vectors []*vector.Vector) error {
@@ -633,10 +634,14 @@ func (exec *sumAvgDecExec[A, S]) batchFillSum(offset int, groups []uint64, vecto
 				break
 			}
 			if localGrps[s] == g {
-				// Unchecked add is safe: Decimal128 has 38 digits of range,
-				// local buffer holds at most 4096 values (one batch), so overflow
-				// requires individual values near 10^34 which exceeds DECIMAL(15,2).
-				localSums[s] = decimalStateAddUnchecked(localSums[s], val)
+				if exec.localAddSafe {
+					localSums[s] = decimalStateAddUnchecked(localSums[s], val)
+				} else {
+					var err error
+					if localSums[s], err = decimalStateAdd(localSums[s], val); err != nil {
+						return err
+					}
+				}
 				break
 			}
 			h++
@@ -727,7 +732,14 @@ func (exec *sumAvgDecExec[A, S]) batchFillAvg(offset int, groups []uint64, vecto
 				break
 			}
 			if localGrps[s] == g {
-				localSums[s] = decimalStateAddUnchecked(localSums[s], val)
+				if exec.localAddSafe {
+					localSums[s] = decimalStateAddUnchecked(localSums[s], val)
+				} else {
+					var err error
+					if localSums[s], err = decimalStateAdd(localSums[s], val); err != nil {
+						return err
+					}
+				}
 				localCnts[s]++
 				break
 			}
@@ -991,6 +1003,14 @@ func newSumAvgDecExec[A sumAvgDecimalArg, S sumAvgDecimalState](mp *mpool.MPool,
 	var exec sumAvgDecExec[A, S]
 	exec.mp = mp
 	exec.isSum = isSum
+	// Local buffer overflow is impossible when state is wider than arg:
+	//   Decimal64→Decimal128: 255 × 10^18 < 10^38 ✓
+	//   Decimal128→Decimal256: 255 × 10^38 < 10^76 ✓
+	//   Decimal256→Decimal256: 255 × 10^76 > 10^76 ✗
+	var a A
+	var s S
+	exec.localAddSafe = unsafe.Sizeof(s) > unsafe.Sizeof(a)
+
 	var rt types.Type
 	sumTyp := SumReturnType([]types.Type{param})
 	avgTyp := AvgReturnType([]types.Type{param})
