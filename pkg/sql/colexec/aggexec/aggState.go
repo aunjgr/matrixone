@@ -620,9 +620,7 @@ func (ae *aggExec) GetOptResult() SplitResult {
 }
 
 func (ae *aggExec) getXY(u uint64) (int, uint16) {
-	x := u / AggBatchSize
-	y := u % AggBatchSize
-	return int(x), uint16(y)
+	return int(u >> aggBatchSizeShift), uint16(u & aggBatchSizeMask)
 }
 
 func (ae *aggExec) rebuildChunkPtrs() {
