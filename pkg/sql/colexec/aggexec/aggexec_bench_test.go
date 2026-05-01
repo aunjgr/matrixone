@@ -97,6 +97,30 @@ func BenchmarkAggExecPaths(b *testing.B) {
 		}
 	})
 
+	b.Run("SumDecimal64Fast/BatchFill", func(b *testing.B) {
+		b.ReportAllocs()
+		b.StopTimer()
+		dec64Vals := make([]types.Decimal64, rows)
+		for i := range dec64Vals {
+			dec64Vals[i] = types.Decimal64(int64(i%100000) * 100)
+		}
+		dec64Vec := testutil.NewDecimal64Vector(rows, types.New(types.T_decimal64, 15, 2), mp, false, nil, dec64Vals)
+		defer dec64Vec.Free(mp)
+		vectors := []*vector.Vector{dec64Vec}
+		for i := 0; i < b.N; i++ {
+			exec := newSumDecimal64FastExec(mp, true, AggIdOfSum, false, types.New(types.T_decimal64, 15, 2))
+			if err := exec.GroupGrow(groupSize); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+			if err := exec.BatchFill(0, groups, vectors); err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			exec.Free()
+		}
+	})
+
 	b.Run("AvgDecimal64/BatchFill", func(b *testing.B) {
 		b.ReportAllocs()
 		b.StopTimer()

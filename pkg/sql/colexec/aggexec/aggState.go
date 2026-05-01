@@ -623,6 +623,10 @@ func (ae *aggExec) getXY(u uint64) (int, uint16) {
 	return int(u >> aggBatchSizeShift), uint16(u & aggBatchSizeMask)
 }
 
+func chunkData[T any](ptr unsafe.Pointer) *[AggBatchSize]T {
+	return (*[AggBatchSize]T)(ptr)
+}
+
 func (ae *aggExec) rebuildChunkPtrs() {
 	ae.chunkPtrs = ae.chunkPtrs[:0]
 	for _, s := range ae.state {
