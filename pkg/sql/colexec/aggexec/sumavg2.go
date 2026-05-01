@@ -16,7 +16,6 @@ package aggexec
 
 import (
 	"slices"
-	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -284,8 +283,7 @@ func (exec *sumAvgExec[T, A]) batchFillAvg(offset int, groups []uint64, vectors 
 						return err
 					}
 					sums[y] = result
-					cntPtr := exec.state[x].vecs[1].GetData()
-					cnts := (*[AggBatchSize]int64)(unsafe.Pointer(&cntPtr[0]))
+					cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
 					cnts[y]++
 					break
 				}
@@ -325,8 +323,7 @@ func (exec *sumAvgExec[T, A]) batchFillAvg(offset int, groups []uint64, vectors 
 		}
 		sums[y] = result
 
-		cntPtr := exec.state[x].vecs[1].GetData()
-		cnts := (*[AggBatchSize]int64)(unsafe.Pointer(&cntPtr[0]))
+		cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
 		cnts[y] += localCnts[s]
 	}
 	return nil
@@ -376,8 +373,8 @@ func (exec *sumAvgExec[T, A]) BatchMerge(next AggFuncExec, offset int, groups []
 				return err
 			}
 			sums1[y1] = result
-			cnts1 := (*[AggBatchSize]int64)(unsafe.Pointer(&vector.MustFixedColNoTypeCheck[int64](exec.state[x1].vecs[1])[0]))
-			cnts2 := (*[AggBatchSize]int64)(unsafe.Pointer(&vector.MustFixedColNoTypeCheck[int64](other.state[x2].vecs[1])[0]))
+			cnts1 := vector.MustFixedColNoTypeCheck[int64](exec.state[x1].vecs[1])
+			cnts2 := vector.MustFixedColNoTypeCheck[int64](other.state[x2].vecs[1])
 			cnts1[y1] += cnts2[y2]
 		}
 	}
@@ -719,7 +716,7 @@ func (exec *sumAvgDecExec[A, S]) batchFillAvg(offset int, groups []uint64, vecto
 					if sums[y], err = decimalStateAdd(sums[y], val); err != nil {
 						return err
 					}
-					cnts := (*[AggBatchSize]int64)(unsafe.Pointer(&vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])[0]))
+					cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
 					cnts[y]++
 					break
 				}
@@ -756,7 +753,7 @@ func (exec *sumAvgDecExec[A, S]) batchFillAvg(offset int, groups []uint64, vecto
 		if sums[y], err = decimalStateAdd(sums[y], localSums[s]); err != nil {
 			return err
 		}
-		cnts := (*[AggBatchSize]int64)(unsafe.Pointer(&vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])[0]))
+		cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
 		cnts[y] += localCnts[s]
 	}
 	return nil
@@ -803,8 +800,8 @@ func (exec *sumAvgDecExec[A, S]) BatchMerge(next AggFuncExec, offset int, groups
 			if sums1[y1], err = decimalStateAdd(sums1[y1], sums2[y2]); err != nil {
 				return err
 			}
-			cnts1 := (*[AggBatchSize]int64)(unsafe.Pointer(&vector.MustFixedColNoTypeCheck[int64](exec.state[x1].vecs[1])[0]))
-			cnts2 := (*[AggBatchSize]int64)(unsafe.Pointer(&vector.MustFixedColNoTypeCheck[int64](other.state[x2].vecs[1])[0]))
+			cnts1 := vector.MustFixedColNoTypeCheck[int64](exec.state[x1].vecs[1])
+			cnts2 := vector.MustFixedColNoTypeCheck[int64](other.state[x2].vecs[1])
 			cnts1[y1] += cnts2[y2]
 		}
 	}
@@ -1008,8 +1005,12 @@ func newSumAvgDecExec[A sumAvgDecimalArg, S sumAvgDecimalState](mp *mpool.MPool,
 	//   Decimal128→Decimal256: 255 × 10^38 < 10^76 ✓
 	//   Decimal256→Decimal256: 255 × 10^76 > 10^76 ✗
 	var a A
-	var s S
-	exec.localAddSafe = unsafe.Sizeof(s) > unsafe.Sizeof(a)
+	switch any(a).(type) {
+	case types.Decimal64, types.Decimal128:
+		exec.localAddSafe = true
+	default:
+		exec.localAddSafe = false
+	}
 
 	var rt types.Type
 	sumTyp := SumReturnType([]types.Type{param})
