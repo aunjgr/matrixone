@@ -288,6 +288,29 @@ func BenchmarkAggExecPaths(b *testing.B) {
 		}
 	})
 
+	b.Run("SumInt64/BatchFill/512groups", func(b *testing.B) {
+		b.ReportAllocs()
+		const bigGroupSize = 512
+		bigGroups := make([]uint64, rows)
+		for i := range bigGroups {
+			bigGroups[i] = uint64((i % bigGroupSize) + 1)
+		}
+		vectors := []*vector.Vector{intVec}
+		b.StopTimer()
+		for i := 0; i < b.N; i++ {
+			exec := newSumAvgExec[int64, int64](mp, int64OfCheck, true, AggIdOfSum, false, types.T_int64.ToType())
+			if err := exec.GroupGrow(bigGroupSize); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+			if err := exec.BatchFill(0, bigGroups, vectors); err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			exec.Free()
+		}
+	})
+
 	b.Run("GroupConcat/BatchFill", func(b *testing.B) {
 		b.ReportAllocs()
 		info := multiAggInfo{
@@ -311,5 +334,142 @@ func BenchmarkAggExecPaths(b *testing.B) {
 			b.StopTimer()
 			exec.Free()
 		}
+	})
+}
+
+// TestLocalAccumulatorOverflow exercises the direct-scatter fallback path
+// that triggers when a single BatchFill has more than 255 distinct groups.
+func TestLocalAccumulatorOverflow(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer func() {
+		if mp.CurrNB() != 0 {
+			t.Fatalf("memory leak: %d bytes", mp.CurrNB())
+		}
+	}()
+
+	const (
+		numGroups = 512
+		rows      = 1024
+	)
+
+	groups := make([]uint64, rows)
+	for i := range groups {
+		groups[i] = uint64((i % numGroups) + 1)
+	}
+
+	intVals := make([]int64, rows)
+	for i := range intVals {
+		intVals[i] = int64(i + 1)
+	}
+	intVec := testutil.NewInt64Vector(rows, types.T_int64.ToType(), mp, false, nil, intVals)
+	defer intVec.Free(mp)
+
+	t.Run("SumInt64", func(t *testing.T) {
+		exec := newSumAvgExec[int64, int64](mp, int64OfCheck, true, AggIdOfSum, false, types.T_int64.ToType())
+		if err := exec.GroupGrow(numGroups); err != nil {
+			t.Fatal(err)
+		}
+		if err := exec.BatchFill(0, groups, []*vector.Vector{intVec}); err != nil {
+			t.Fatal(err)
+		}
+		results, err := exec.Flush()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Verify: each group g (0-indexed) gets values (g+1) and (g+1+512).
+		// sum = (g+1) + (g+1+512) = 2g + 514
+		for _, vec := range results {
+			vals := vector.MustFixedColNoTypeCheck[int64](vec)
+			for g := 0; g < numGroups; g++ {
+				expected := int64(2*g + 514)
+				if vals[g] != expected {
+					t.Fatalf("group %d: got %d, want %d", g, vals[g], expected)
+				}
+			}
+			vec.Free(mp)
+		}
+		exec.Free()
+	})
+
+	t.Run("CountColumn", func(t *testing.T) {
+		exec := newCountColumnExec(mp, AggIdOfCountColumn, false, types.T_int64.ToType())
+		if err := exec.GroupGrow(numGroups); err != nil {
+			t.Fatal(err)
+		}
+		if err := exec.BatchFill(0, groups, []*vector.Vector{intVec}); err != nil {
+			t.Fatal(err)
+		}
+		results, err := exec.Flush()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, vec := range results {
+			vals := vector.MustFixedColNoTypeCheck[int64](vec)
+			for g := 0; g < numGroups; g++ {
+				if vals[g] != 2 {
+					t.Fatalf("group %d: got %d, want 2", g, vals[g])
+				}
+			}
+			vec.Free(mp)
+		}
+		exec.Free()
+	})
+
+	t.Run("MinInt64", func(t *testing.T) {
+		exec := makeMinMaxExec(mp, AggIdOfMin, true, types.T_int64.ToType())
+		if err := exec.GroupGrow(numGroups); err != nil {
+			t.Fatal(err)
+		}
+		if err := exec.BatchFill(0, groups, []*vector.Vector{intVec}); err != nil {
+			t.Fatal(err)
+		}
+		results, err := exec.Flush()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, vec := range results {
+			vals := vector.MustFixedColNoTypeCheck[int64](vec)
+			for g := 0; g < numGroups; g++ {
+				expected := int64(g + 1)
+				if vals[g] != expected {
+					t.Fatalf("group %d: got %d, want %d", g, vals[g], expected)
+				}
+			}
+			vec.Free(mp)
+		}
+		exec.Free()
+	})
+
+	t.Run("SumDecimal64Fast", func(t *testing.T) {
+		dec64Vals := make([]types.Decimal64, rows)
+		for i := range dec64Vals {
+			dec64Vals[i] = types.Decimal64(int64(i+1) * 100)
+		}
+		dec64Vec := testutil.NewDecimal64Vector(rows, types.New(types.T_decimal64, 15, 2), mp, false, nil, dec64Vals)
+		defer dec64Vec.Free(mp)
+
+		exec := newSumDecimal64FastExec(mp, true, AggIdOfSum, false, types.New(types.T_decimal64, 15, 2))
+		if err := exec.GroupGrow(numGroups); err != nil {
+			t.Fatal(err)
+		}
+		if err := exec.BatchFill(0, groups, []*vector.Vector{dec64Vec}); err != nil {
+			t.Fatal(err)
+		}
+		results, err := exec.Flush()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, vec := range results {
+			vals := vector.MustFixedColNoTypeCheck[types.Decimal128](vec)
+			for g := 0; g < numGroups; g++ {
+				// sum = ((g+1) + (g+1+512)) * 100 = (2g+514)*100
+				expected := types.Decimal128{B0_63: uint64(int64(2*g+514) * 100), B64_127: 0}
+				if vals[g] != expected {
+					t.Fatalf("group %d: got %v, want %v", g, vals[g], expected)
+				}
+			}
+			vec.Free(mp)
+		}
+		exec.Free()
 	})
 }

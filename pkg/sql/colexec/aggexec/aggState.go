@@ -644,6 +644,14 @@ func (ae *aggExec) GroupGrow(more int) error {
 			panic(err)
 		}
 		ae.state[0].grow(ae.mp, 1, true)
+		// Ensure vecs have AggBatchSize capacity so chunkArr is safe.
+		for _, vec := range ae.state[0].vecs {
+			if vec != nil && vec.Capacity() < AggBatchSize {
+				if err := vec.PreExtend(AggBatchSize, ae.mp); err != nil {
+					panic(err)
+				}
+			}
+		}
 		return nil
 	}
 
@@ -763,6 +771,14 @@ func (ae *aggExec) UnmarshalFromReader(reader io.Reader, mp *mpool.MPool) error 
 		ae.state = make([]aggState, 1)
 		if _, err := ae.state[0].readState(mp, reader, &ae.aggInfo); err != nil {
 			return err
+		}
+		// Ensure vecs have AggBatchSize capacity so chunkArr is safe.
+		for _, vec := range ae.state[0].vecs {
+			if vec != nil && vec.Capacity() < AggBatchSize {
+				if err := vec.PreExtend(AggBatchSize, mp); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}
