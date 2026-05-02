@@ -176,7 +176,7 @@ func (exec *sumAvgExec[T, A]) batchFillSum(offset int, groups []uint64, vectors 
 					// Local table full — direct scatter for this row.
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					sums := (*[AggBatchSize]T)(exec.chunkPtrs[x])
+					sums := chunkArr[T](exec.state[x].vecs[0])
 					old := sums[y]
 					result := old + val
 					if err := exec.ofCheck(old, val, result); err != nil {
@@ -213,7 +213,7 @@ func (exec *sumAvgExec[T, A]) batchFillSum(offset int, groups []uint64, vectors 
 		x := int(g >> aggBatchSizeShift)
 		y := g & aggBatchSizeMask
 
-		sums := (*[AggBatchSize]T)(exec.chunkPtrs[x])
+		sums := chunkArr[T](exec.state[x].vecs[0])
 		old := sums[y]
 		add := localSums[s]
 		result := old + add
@@ -228,7 +228,6 @@ func (exec *sumAvgExec[T, A]) batchFillSum(offset int, groups []uint64, vectors 
 	}
 	return nil
 }
-
 
 func (exec *sumAvgExec[T, A]) batchFillAvg(offset int, groups []uint64, vectors []*vector.Vector) error {
 	vec := vectors[0]
@@ -276,7 +275,7 @@ func (exec *sumAvgExec[T, A]) batchFillAvg(offset int, groups []uint64, vectors 
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					sums := (*[AggBatchSize]T)(exec.chunkPtrs[x])
+					sums := chunkArr[T](exec.state[x].vecs[0])
 					old := sums[y]
 					result := old + val
 					if err := exec.ofCheck(old, val, result); err != nil {
@@ -314,7 +313,7 @@ func (exec *sumAvgExec[T, A]) batchFillAvg(offset int, groups []uint64, vectors 
 		x := int(g >> aggBatchSizeShift)
 		y := g & aggBatchSizeMask
 
-		sums := (*[AggBatchSize]T)(exec.chunkPtrs[x])
+		sums := chunkArr[T](exec.state[x].vecs[0])
 		old := sums[y]
 		add := localSums[s]
 		result := old + add
@@ -351,8 +350,8 @@ func (exec *sumAvgExec[T, A]) BatchMerge(next AggFuncExec, offset int, groups []
 		x2 := int(g2 >> aggBatchSizeShift)
 		y2 := g2 & aggBatchSizeMask
 
-		sums1 := (*[AggBatchSize]T)(exec.chunkPtrs[x1])
-		sums2 := (*[AggBatchSize]T)(other.chunkPtrs[x2])
+		sums1 := chunkArr[T](exec.state[x1].vecs[0])
+		sums2 := chunkArr[T](other.state[x2].vecs[0])
 
 		if exec.isSum {
 			if other.state[x2].vecs[0].IsNull(y2) {
@@ -542,8 +541,8 @@ func decimalStateAddUnchecked[S sumAvgDecimalState](left, right S) S {
 
 type sumAvgDecExec[A sumAvgDecimalArg, S sumAvgDecimalState] struct {
 	aggExec
-	isSum            bool
-	localAddSafe     bool // true when state type is wider than arg type (overflow impossible in local buffer)
+	isSum        bool
+	localAddSafe bool // true when state type is wider than arg type (overflow impossible in local buffer)
 }
 
 func (exec *sumAvgDecExec[A, S]) Fill(groupIndex int, row int, vectors []*vector.Vector) error {
@@ -610,7 +609,7 @@ func (exec *sumAvgDecExec[A, S]) batchFillSum(offset int, groups []uint64, vecto
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					sums := (*[AggBatchSize]S)(exec.chunkPtrs[x])
+					sums := chunkArr[S](exec.state[x].vecs[0])
 					sumVec := exec.state[x].vecs[0]
 					if sumVec.IsNull(y) {
 						sumVec.UnsetNull(y)
@@ -649,7 +648,7 @@ func (exec *sumAvgDecExec[A, S]) batchFillSum(offset int, groups []uint64, vecto
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
 		y := g & aggBatchSizeMask
-		sums := (*[AggBatchSize]S)(exec.chunkPtrs[x])
+		sums := chunkArr[S](exec.state[x].vecs[0])
 		sumVec := exec.state[x].vecs[0]
 		if sumVec.IsNull(y) {
 			sumVec.UnsetNull(y)
@@ -711,7 +710,7 @@ func (exec *sumAvgDecExec[A, S]) batchFillAvg(offset int, groups []uint64, vecto
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					sums := (*[AggBatchSize]S)(exec.chunkPtrs[x])
+					sums := chunkArr[S](exec.state[x].vecs[0])
 					var err error
 					if sums[y], err = decimalStateAdd(sums[y], val); err != nil {
 						return err
@@ -748,7 +747,7 @@ func (exec *sumAvgDecExec[A, S]) batchFillAvg(offset int, groups []uint64, vecto
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
 		y := g & aggBatchSizeMask
-		sums := (*[AggBatchSize]S)(exec.chunkPtrs[x])
+		sums := chunkArr[S](exec.state[x].vecs[0])
 		var err error
 		if sums[y], err = decimalStateAdd(sums[y], localSums[s]); err != nil {
 			return err
@@ -782,8 +781,8 @@ func (exec *sumAvgDecExec[A, S]) BatchMerge(next AggFuncExec, offset int, groups
 		x2 := int(g2 >> aggBatchSizeShift)
 		y2 := g2 & aggBatchSizeMask
 
-		sums1 := (*[AggBatchSize]S)(exec.chunkPtrs[x1])
-		sums2 := (*[AggBatchSize]S)(other.chunkPtrs[x2])
+		sums1 := chunkArr[S](exec.state[x1].vecs[0])
+		sums2 := chunkArr[S](other.state[x2].vecs[0])
 
 		if exec.isSum {
 			if other.state[x2].vecs[0].IsNull(y2) {

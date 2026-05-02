@@ -92,7 +92,7 @@ func (exec *minMaxExecFixed[T]) BatchFill(offset int, groups []uint64, vectors [
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					aggs := (*[AggBatchSize]T)(exec.chunkPtrs[x])
+					aggs := chunkArr[T](exec.state[x].vecs[0])
 					aggVec := exec.state[x].vecs[0]
 					if aggVec.IsNull(y) {
 						aggVec.UnsetNull(y)
@@ -128,7 +128,7 @@ func (exec *minMaxExecFixed[T]) BatchFill(offset int, groups []uint64, vectors [
 		x := int(g >> aggBatchSizeShift)
 		y := g & aggBatchSizeMask
 
-		aggs := (*[AggBatchSize]T)(exec.chunkPtrs[x])
+		aggs := chunkArr[T](exec.state[x].vecs[0])
 		aggVec := exec.state[x].vecs[0]
 		if aggVec.IsNull(y) {
 			aggVec.UnsetNull(y)
@@ -139,7 +139,6 @@ func (exec *minMaxExecFixed[T]) BatchFill(offset int, groups []uint64, vectors [
 	}
 	return nil
 }
-
 
 func (exec *minMaxExecFixed[T]) Merge(next AggFuncExec, groupIdx1, groupIdx2 int) error {
 	return exec.BatchMerge(next, groupIdx2, []uint64{uint64(groupIdx1 + 1)})
@@ -159,8 +158,8 @@ func (exec *minMaxExecFixed[T]) BatchMerge(next AggFuncExec, offset int, groups 
 		x2 := int(g2 >> aggBatchSizeShift)
 		y2 := g2 & aggBatchSizeMask
 
-		aggs1 := (*[AggBatchSize]T)(exec.chunkPtrs[x1])
-		aggs2 := (*[AggBatchSize]T)(other.chunkPtrs[x2])
+		aggs1 := chunkArr[T](exec.state[x1].vecs[0])
+		aggs2 := chunkArr[T](other.state[x2].vecs[0])
 
 		if other.state[x2].vecs[0].IsNull(y2) {
 			continue

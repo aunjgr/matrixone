@@ -72,7 +72,7 @@ func (exec *countStarExec) BatchFill(offset int, groups []uint64, vectors []*vec
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					vals := (*[AggBatchSize]int64)(exec.chunkPtrs[x])
+					vals := chunkArr[int64](exec.state[x].vecs[0])
 					vals[y]++
 					break
 				}
@@ -95,7 +95,7 @@ func (exec *countStarExec) BatchFill(offset int, groups []uint64, vectors []*vec
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
 		y := g & aggBatchSizeMask
-		vals := (*[AggBatchSize]int64)(exec.chunkPtrs[x])
+		vals := chunkArr[int64](exec.state[x].vecs[0])
 		vals[y] += localCnts[s]
 	}
 	return nil
@@ -117,8 +117,8 @@ func (exec *countStarExec) BatchMerge(next AggFuncExec, offset int, groups []uin
 		y1 := g1 & aggBatchSizeMask
 		x2 := int(g2 >> aggBatchSizeShift)
 		y2 := g2 & aggBatchSizeMask
-		vals1 := (*[AggBatchSize]int64)(exec.chunkPtrs[x1])
-		vals2 := (*[AggBatchSize]int64)(other.chunkPtrs[x2])
+		vals1 := chunkArr[int64](exec.state[x1].vecs[0])
+		vals2 := chunkArr[int64](other.state[x2].vecs[0])
 		vals1[y1] += vals2[y2]
 	}
 	return nil
@@ -201,7 +201,7 @@ func (exec *countColumnExec) BatchFill(offset int, groups []uint64, vectors []*v
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					vals := (*[AggBatchSize]int64)(exec.chunkPtrs[x])
+					vals := chunkArr[int64](exec.state[x].vecs[0])
 					vals[y]++
 					break
 				}
@@ -224,7 +224,7 @@ func (exec *countColumnExec) BatchFill(offset int, groups []uint64, vectors []*v
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
 		y := g & aggBatchSizeMask
-		vals := (*[AggBatchSize]int64)(exec.chunkPtrs[x])
+		vals := chunkArr[int64](exec.state[x].vecs[0])
 		vals[y] += localCnts[s]
 	}
 	return nil
@@ -251,8 +251,8 @@ func (exec *countColumnExec) BatchMerge(next AggFuncExec, offset int, groups []u
 		y1 := g1 & aggBatchSizeMask
 		x2 := int(g2 >> aggBatchSizeShift)
 		y2 := g2 & aggBatchSizeMask
-		vals1 := (*[AggBatchSize]int64)(exec.chunkPtrs[x1])
-		vals2 := (*[AggBatchSize]int64)(other.chunkPtrs[x2])
+		vals1 := chunkArr[int64](exec.state[x1].vecs[0])
+		vals2 := chunkArr[int64](other.state[x2].vecs[0])
 		vals1[y1] += vals2[y2]
 	}
 	return nil

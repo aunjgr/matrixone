@@ -80,10 +80,6 @@ func (exec *sumDecimal64FastExec) batchFill(offset int, groups []uint64, vectors
 	if vec.IsConstNull() {
 		return nil
 	}
-	n := len(groups)
-	if n == 0 {
-		return nil
-	}
 	vals := vector.MustFixedColNoTypeCheck[types.Decimal64](vec)
 	constMask := -min(1, len(vals)-1)
 	hasNull := vec.HasNull()
@@ -92,20 +88,17 @@ func (exec *sumDecimal64FastExec) batchFill(offset int, groups []uint64, vectors
 		np = vec.GetNulls().GetBitmap()
 	}
 
-	const slotEmpty = 0xFF
 	const maxSlots = 255
 	var slotOf [256]uint8
 	var localSums [maxSlots]types.Decimal128
 	var localCnts [maxSlots]int64
 	var localGrps [maxSlots]uint64
 	nSlots := 0
-
 	for i := range slotOf {
-		slotOf[i] = slotEmpty
+		slotOf[i] = 0xFF
 	}
 
-	for i := 0; i < n; i++ {
-		grp := groups[i]
+	for i, grp := range groups {
 		if grp == GroupNotMatched {
 			continue
 		}
@@ -113,27 +106,22 @@ func (exec *sumDecimal64FastExec) batchFill(offset int, groups []uint64, vectors
 		if hasNull && np.Contains(uint64(idx)) {
 			continue
 		}
-
 		g := grp - 1
 		raw := vals[idx&constMask]
-		hi := uint64(int64(raw) >> 63)
-		val := types.Decimal128{B0_63: uint64(raw), B64_127: hi}
+		val := types.Decimal128{B0_63: uint64(raw), B64_127: uint64(int64(raw) >> 63)}
 
-		h := uint8(g) ^ uint8(g>>8)
-		for {
+		for h := uint8(g) ^ uint8(g>>8); ; h++ {
 			s := slotOf[h]
-			if s == slotEmpty {
+			if s == 0xFF {
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					sums := chunkData[types.Decimal128](exec.chunkPtrs[x])
-					sums[y] = sums[y].Add128Unchecked(val)
-					cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
-					cnts[y]++
+					chunkArr[types.Decimal128](exec.state[x].vecs[0])[y] =
+						chunkArr[types.Decimal128](exec.state[x].vecs[0])[y].Add128Unchecked(val)
+					vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])[y]++
 					break
 				}
-				s = uint8(nSlots)
-				slotOf[h] = s
+				slotOf[h] = uint8(nSlots)
 				localGrps[nSlots] = g
 				localSums[nSlots] = val
 				localCnts[nSlots] = 1
@@ -145,17 +133,22 @@ func (exec *sumDecimal64FastExec) batchFill(offset int, groups []uint64, vectors
 				localCnts[s]++
 				break
 			}
-			h++
 		}
 	}
 
+	lastX := -1
+	var sums *[AggBatchSize]types.Decimal128
+	var cnts []int64
 	for s := 0; s < nSlots; s++ {
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
+		if x != lastX {
+			lastX = x
+			sums = chunkArr[types.Decimal128](exec.state[x].vecs[0])
+			cnts = vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
+		}
 		y := g & aggBatchSizeMask
-		sums := chunkData[types.Decimal128](exec.chunkPtrs[x])
 		sums[y] = sums[y].Add128Unchecked(localSums[s])
-		cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
 		cnts[y] += localCnts[s]
 	}
 	return nil
@@ -341,10 +334,6 @@ func (exec *sumDecimal128FastExec) batchFill(offset int, groups []uint64, vector
 	if vec.IsConstNull() {
 		return nil
 	}
-	n := len(groups)
-	if n == 0 {
-		return nil
-	}
 	vals := vector.MustFixedColNoTypeCheck[types.Decimal128](vec)
 	constMask := -min(1, len(vals)-1)
 	hasNull := vec.HasNull()
@@ -352,21 +341,19 @@ func (exec *sumDecimal128FastExec) batchFill(offset int, groups []uint64, vector
 	if hasNull {
 		np = vec.GetNulls().GetBitmap()
 	}
+	checked := exec.overflowCheck
 
-	const slotEmpty = 0xFF
 	const maxSlots = 255
 	var slotOf [256]uint8
 	var localSums [maxSlots]types.Decimal128
 	var localCnts [maxSlots]int64
 	var localGrps [maxSlots]uint64
 	nSlots := 0
-
 	for i := range slotOf {
-		slotOf[i] = slotEmpty
+		slotOf[i] = 0xFF
 	}
 
-	for i := 0; i < n; i++ {
-		grp := groups[i]
+	for i, grp := range groups {
 		if grp == GroupNotMatched {
 			continue
 		}
@@ -374,19 +361,17 @@ func (exec *sumDecimal128FastExec) batchFill(offset int, groups []uint64, vector
 		if hasNull && np.Contains(uint64(idx)) {
 			continue
 		}
-
 		g := grp - 1
 		val := vals[idx&constMask]
 
-		h := uint8(g) ^ uint8(g>>8)
-		for {
+		for h := uint8(g) ^ uint8(g>>8); ; h++ {
 			s := slotOf[h]
-			if s == slotEmpty {
+			if s == 0xFF {
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					sums := chunkData[types.Decimal128](exec.chunkPtrs[x])
-					if exec.overflowCheck {
+					sums := chunkArr[types.Decimal128](exec.state[x].vecs[0])
+					if checked {
 						var err error
 						if sums[y], err = sums[y].Add128(val); err != nil {
 							return err
@@ -394,12 +379,10 @@ func (exec *sumDecimal128FastExec) batchFill(offset int, groups []uint64, vector
 					} else {
 						sums[y] = sums[y].Add128Unchecked(val)
 					}
-					cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
-					cnts[y]++
+					vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])[y]++
 					break
 				}
-				s = uint8(nSlots)
-				slotOf[h] = s
+				slotOf[h] = uint8(nSlots)
 				localGrps[nSlots] = g
 				localSums[nSlots] = val
 				localCnts[nSlots] = 1
@@ -407,7 +390,7 @@ func (exec *sumDecimal128FastExec) batchFill(offset int, groups []uint64, vector
 				break
 			}
 			if localGrps[s] == g {
-				if exec.overflowCheck {
+				if checked {
 					var err error
 					if localSums[s], err = localSums[s].Add128(val); err != nil {
 						return err
@@ -418,16 +401,22 @@ func (exec *sumDecimal128FastExec) batchFill(offset int, groups []uint64, vector
 				localCnts[s]++
 				break
 			}
-			h++
 		}
 	}
 
+	lastX := -1
+	var sums *[AggBatchSize]types.Decimal128
+	var cnts []int64
 	for s := 0; s < nSlots; s++ {
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
+		if x != lastX {
+			lastX = x
+			sums = chunkArr[types.Decimal128](exec.state[x].vecs[0])
+			cnts = vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
+		}
 		y := g & aggBatchSizeMask
-		sums := chunkData[types.Decimal128](exec.chunkPtrs[x])
-		if exec.overflowCheck {
+		if checked {
 			var err error
 			if sums[y], err = sums[y].Add128(localSums[s]); err != nil {
 				return err
@@ -435,7 +424,6 @@ func (exec *sumDecimal128FastExec) batchFill(offset int, groups []uint64, vector
 		} else {
 			sums[y] = sums[y].Add128Unchecked(localSums[s])
 		}
-		cnts := vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])
 		cnts[y] += localCnts[s]
 	}
 	return nil
