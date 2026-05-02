@@ -59,7 +59,6 @@ func (exec *minMaxExecFixed[T]) BatchFill(offset int, groups []uint64, vectors [
 	const maxSlots = 255
 	var slotOf [256]uint8
 	var localVals [maxSlots]T
-	var localInit [maxSlots]bool
 	var localGrps [maxSlots]uint64
 	nSlots := 0
 
@@ -106,7 +105,6 @@ func (exec *minMaxExecFixed[T]) BatchFill(offset int, groups []uint64, vectors [
 				slotOf[h] = s
 				localGrps[nSlots] = g
 				localVals[nSlots] = value
-				localInit[nSlots] = true
 				nSlots++
 				break
 			}
@@ -120,16 +118,18 @@ func (exec *minMaxExecFixed[T]) BatchFill(offset int, groups []uint64, vectors [
 		}
 	}
 
+	lastX := -1
+	var aggs *[AggBatchSize]T
+	var aggVec *vector.Vector
 	for s := 0; s < nSlots; s++ {
-		if !localInit[s] {
-			continue
-		}
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
+		if x != lastX {
+			lastX = x
+			aggs = chunkArr[T](exec.state[x].vecs[0])
+			aggVec = exec.state[x].vecs[0]
+		}
 		y := g & aggBatchSizeMask
-
-		aggs := chunkArr[T](exec.state[x].vecs[0])
-		aggVec := exec.state[x].vecs[0]
 		if aggVec.IsNull(y) {
 			aggVec.UnsetNull(y)
 			aggs[y] = localVals[s]

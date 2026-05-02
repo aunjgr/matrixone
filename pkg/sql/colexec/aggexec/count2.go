@@ -91,11 +91,16 @@ func (exec *countStarExec) BatchFill(offset int, groups []uint64, vectors []*vec
 		}
 	}
 
+	lastX := -1
+	var vals *[AggBatchSize]int64
 	for s := 0; s < nSlots; s++ {
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
+		if x != lastX {
+			lastX = x
+			vals = chunkArr[int64](exec.state[x].vecs[0])
+		}
 		y := g & aggBatchSizeMask
-		vals := chunkArr[int64](exec.state[x].vecs[0])
 		vals[y] += localCnts[s]
 	}
 	return nil
@@ -220,11 +225,16 @@ func (exec *countColumnExec) BatchFill(offset int, groups []uint64, vectors []*v
 		}
 	}
 
+	lastX := -1
+	var vals *[AggBatchSize]int64
 	for s := 0; s < nSlots; s++ {
 		g := localGrps[s]
 		x := int(g >> aggBatchSizeShift)
+		if x != lastX {
+			lastX = x
+			vals = chunkArr[int64](exec.state[x].vecs[0])
+		}
 		y := g & aggBatchSizeMask
-		vals := chunkArr[int64](exec.state[x].vecs[0])
 		vals[y] += localCnts[s]
 	}
 	return nil

@@ -116,8 +116,8 @@ func (exec *sumDecimal64FastExec) batchFill(offset int, groups []uint64, vectors
 				if nSlots >= maxSlots {
 					x := int(g >> aggBatchSizeShift)
 					y := g & aggBatchSizeMask
-					chunkArr[types.Decimal128](exec.state[x].vecs[0])[y] =
-						chunkArr[types.Decimal128](exec.state[x].vecs[0])[y].Add128Unchecked(val)
+					sums := chunkArr[types.Decimal128](exec.state[x].vecs[0])
+					sums[y] = sums[y].Add128Unchecked(val)
 					vector.MustFixedColNoTypeCheck[int64](exec.state[x].vecs[1])[y]++
 					break
 				}
