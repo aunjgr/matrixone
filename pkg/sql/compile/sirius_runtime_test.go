@@ -118,11 +118,13 @@ func TestSiriusRuntimeValidationAndLookup(t *testing.T) {
 		Source: SiriusRuntimeEmbeddedMO, Backend: &siriusAdmissionBackend{accepting: true},
 		CleanupTimeout: time.Second,
 	}
+	require.NoError(t, embeddedMO.InitEmbeddedAdmission(16))
 	require.NoError(t, embeddedMO.Validate())
 	embeddedTAE := &SiriusRuntime{
 		Source: SiriusRuntimeEmbeddedTAE, Backend: &siriusAdmissionBackend{accepting: true},
 		Leases: leases, DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
 	}
+	require.NoError(t, embeddedTAE.InitEmbeddedAdmission(16))
 	require.NoError(t, embeddedTAE.Validate())
 	embeddedTAE.Leases = nondurable
 	require.ErrorContains(t, embeddedTAE.Validate(), "incomplete embedded TAE Sirius runtime")
@@ -214,11 +216,13 @@ func TestSiriusReplayReconcilesOnlyFlightAndEmbeddedTAERejectsIt(t *testing.T) {
 		Leases: embeddedManager, DataDir: t.TempDir(), LeaseTTL: time.Minute,
 		CleanupTimeout: time.Second,
 	}
+	require.NoError(t, embedded.InitEmbeddedAdmission(16))
 	require.ErrorContains(t, embedded.ReconcileReplay(context.Background()), "unreconciled Flight reads")
 
 	mo := &SiriusRuntime{
 		Source: SiriusRuntimeEmbeddedMO, Backend: new(siriusReconcileBackend), CleanupTimeout: time.Second,
 	}
+	require.NoError(t, mo.InitEmbeddedAdmission(16))
 	require.NoError(t, mo.ReconcileReplay(context.Background()))
 }
 
@@ -354,6 +358,7 @@ func TestEmbeddedSiriusAdmissionNeverSilentlyFallsBack(t *testing.T) {
 	previous, existed := runtime.GetGlobalVariables(SiriusRuntimeKey)
 	backend := &siriusAdmissionBackend{accepting: true}
 	configured := &SiriusRuntime{Source: SiriusRuntimeEmbeddedMO, Backend: backend, CleanupTimeout: time.Second}
+	require.NoError(t, configured.InitEmbeddedAdmission(16))
 	runtime.SetGlobalVariables(SiriusRuntimeKey, configured)
 	t.Cleanup(func() {
 		if existed {
@@ -368,6 +373,11 @@ func TestEmbeddedSiriusAdmissionNeverSilentlyFallsBack(t *testing.T) {
 		offloaded, err := c.tryCompileSiriusRead(ctx, query)
 		require.False(t, offloaded)
 		require.Error(t, err, "an invalid explicitly embedded query must fail closed")
+		configured.embeddedAdmission.mu.Lock()
+		require.False(t, configured.embeddedAdmission.active,
+			"pure plan rejection must not claim embedded admission")
+		require.Zero(t, configured.embeddedAdmission.waiters.Len())
+		configured.embeddedAdmission.mu.Unlock()
 		backend.accepting = false
 		offloaded, err = c.tryCompileSiriusRead(ctx, query)
 		require.False(t, offloaded)

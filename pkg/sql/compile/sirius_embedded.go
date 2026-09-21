@@ -266,6 +266,31 @@ func (c *Compile) tryCompileEmbeddedSiriusRead(
 	if err != nil {
 		return false, err
 	}
+	permit, err := runtime.acquireEmbeddedAdmission(ctx)
+	if err != nil {
+		return false, err
+	}
+	permitOwned := true
+	prepareStarted := false
+	var owner *siriusReadOwner
+	published := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if owner != nil && !published {
+				_ = owner.finish(ctx, false)
+			} else if permitOwned {
+				if prepareStarted {
+					runtime.sealEmbeddedAdmission()
+				}
+				permit.release()
+			}
+			panic(recovered)
+		}
+		if permitOwned {
+			permit.release()
+		}
+	}()
+
 	c.initSiriusEmbeddedCompile(queryPlan)
 
 	group := newSiriusProducerGroup(len(plan.reads))
@@ -278,21 +303,16 @@ func (c *Compile) tryCompileEmbeddedSiriusRead(
 
 	// Native preparation is the admission point. In particular, no relation is
 	// opened and no storage reader can start before it succeeds.
-	execution, err := runtime.Backend.Prepare(ctx, plan.request)
+	prepareStarted = true
+	execution, err := runtime.prepareEmbeddedExecution(ctx, plan.request)
 	if err != nil {
 		return false, err
 	}
-	if execution == nil {
-		return false, moerr.NewInternalErrorNoCtx("substrait: embedded preparation returned no execution")
-	}
+	owner = newSiriusEmbeddedReadOwner(execution, runtime, permit)
+	permitOwned = false
 	scopes, err := c.compileSiriusEmbeddedScopes(queryPlan.GetQuery(), plan.reads, group)
 	if err != nil {
-		cleanupCtx, cancel := context.WithTimeoutCause(
-			context.WithoutCancel(ctx), runtime.CleanupTimeout,
-			moerr.NewInternalErrorNoCtx("substrait: timed out cleaning up failed embedded compile"),
-		)
-		defer cancel()
-		return false, errors.Join(err, execution.Cleanup(cleanupCtx))
+		return false, errors.Join(err, owner.finish(ctx, false))
 	}
 	c.scopes = scopes
 	group.setRun(func(runCtx context.Context) error {
@@ -320,7 +340,8 @@ func (c *Compile) tryCompileEmbeddedSiriusRead(
 			return c.runOnce()
 		})
 	})
-	c.siriusRead = newSiriusEmbeddedReadOwner(execution, runtime)
+	c.siriusRead = owner
+	published = true
 	return true, nil
 }
 
@@ -333,6 +354,34 @@ func (c *Compile) tryCompileEmbeddedTAESiriusRead(
 	if err != nil {
 		return false, err
 	}
+	permit, err := runtime.acquireEmbeddedAdmission(ctx)
+	if err != nil {
+		return false, err
+	}
+	permitOwned := true
+	prepareStarted := false
+	nativeOwnsRelease := false
+	var readOwner *SiriusReadPlan
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if permitOwned {
+				// Keep permit release outermost even if lease rollback or native
+				// sealing itself panics while unwinding this failure.
+				defer permit.release()
+			}
+			if readOwner != nil && !nativeOwnsRelease {
+				_ = runtime.abortEmbeddedAdmittedRead(ctx, readOwner,
+					moerr.NewInternalErrorNoCtxf("substrait: panic before embedded TAE preparation: %v", recovered))
+			}
+			if prepareStarted {
+				runtime.sealEmbeddedAdmission()
+			}
+			panic(recovered)
+		}
+		if permitOwned {
+			permit.release()
+		}
+	}()
 
 	relations := make(map[uint64]engine.Relation, len(plan.taeReads))
 	for _, read := range plan.taeReads {
@@ -360,7 +409,7 @@ func (c *Compile) tryCompileEmbeddedTAESiriusRead(
 	if err != nil {
 		return false, err
 	}
-	readOwner := &SiriusReadPlan{
+	readOwner = &SiriusReadPlan{
 		ReadRefs: cloneReadRefs(admitted.ReadRefs), LeaseExpiresAt: admitted.ExpiresAt,
 	}
 	for i, read := range plan.taeReads {
@@ -380,20 +429,16 @@ func (c *Compile) tryCompileEmbeddedTAESiriusRead(
 	plan.request.Release = func(releaseCtx context.Context) error {
 		return readOwner.Release(releaseCtx, runtime.Leases)
 	}
-	execution, err := runtime.Backend.Prepare(ctx, plan.request)
+	prepareStarted = true
+	nativeOwnsRelease = true
+	execution, err := runtime.prepareEmbeddedExecution(ctx, plan.request)
 	if err != nil {
 		// Prepare owns Release on every return once called. The embedded bridge
 		// retains failed cleanup for retry rather than exposing an unsafe fallback.
 		return false, err
 	}
-	if execution == nil {
-		// Prepare owns Release once called, including an invalid nil-success
-		// return. Do not race or duplicate the backend's retryable cleanup.
-		cause := moerr.NewInternalErrorNoCtx(
-			"substrait: embedded TAE preparation returned no execution")
-		return false, runtime.sealEmbeddedRuntime(ctx, cause)
-	}
-	c.siriusRead = newSiriusEmbeddedReadOwner(execution, runtime)
+	c.siriusRead = newSiriusEmbeddedReadOwner(execution, runtime, permit)
+	permitOwned = false
 	return true, nil
 }
 

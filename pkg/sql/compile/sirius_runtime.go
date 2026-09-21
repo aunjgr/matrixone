@@ -17,6 +17,7 @@ package compile
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -84,10 +85,30 @@ type SiriusRuntime struct {
 	DataDir                  string
 	LeaseTTL                 time.Duration
 	CleanupTimeout           time.Duration
+	embeddedAdmission        *siriusEmbeddedAdmissionGate
 	// BenchmarkNoGC is set only by the CN launcher after it verifies that the
 	// paired TN has disabled GC. It permits the explicitly non-durable,
 	// process-local lease manager used by the local-CN benchmark profile.
 	BenchmarkNoGC bool
+}
+
+// InitEmbeddedAdmission installs the runtime-scoped admission gate before the
+// runtime is published to a CN. A zero value selects the design default of 16
+// queued requests. The runtime is immutable after publication, so repeated
+// initialization is rejected rather than replacing a live generation.
+func (r *SiriusRuntime) InitEmbeddedAdmission(maxWaiting uint32) error {
+	if r == nil || !r.Source.embedded() {
+		return moerr.NewBadConfigNoCtx("Sirius embedded admission requires an embedded runtime")
+	}
+	if r.embeddedAdmission != nil {
+		return moerr.NewInvalidStateNoCtx("substrait: embedded Sirius admission is already initialized")
+	}
+	gate, err := newSiriusEmbeddedAdmissionGate(maxWaiting)
+	if err != nil {
+		return err
+	}
+	r.embeddedAdmission = gate
+	return nil
 }
 
 func (r *SiriusRuntime) Validate() error {
@@ -95,6 +116,9 @@ func (r *SiriusRuntime) Validate() error {
 		return moerr.NewInternalErrorNoCtx("substrait: incomplete CN Sirius runtime")
 	}
 	if r.Source.embedded() {
+		if r.embeddedAdmission == nil || !r.embeddedAdmission.accepting() {
+			return moerr.NewInvalidStateNoCtx("substrait: embedded Sirius admission is sealed or uninitialized")
+		}
 		if r.BenchmarkNoGC {
 			return moerr.NewInternalErrorNoCtx("substrait: embedded Sirius cannot use benchmark lease mode")
 		}
@@ -142,6 +166,11 @@ func (r *SiriusRuntime) Close(ctx context.Context) error {
 		return nil
 	}
 	var result error
+	if r.Source.embedded() && r.embeddedAdmission != nil {
+		// Wake queued callers before a potentially blocking native close. The
+		// active permit remains owned by its execution until that owner quiesces.
+		r.embeddedAdmission.seal()
+	}
 	if r.Backend != nil {
 		result = errors.Join(result, r.Backend.Close(ctx))
 	}
@@ -197,26 +226,104 @@ func lookupSiriusRuntime(service string) (*SiriusRuntime, bool) {
 }
 
 type siriusReadOwner struct {
-	execution SiriusExecution
-	runtime   *SiriusRuntime
-	source    SiriusRuntimeSource
+	execution      SiriusExecution
+	runtime        *SiriusRuntime
+	source         SiriusRuntimeSource
+	permit         *siriusEmbeddedAdmissionPermit
+	cleanupMu      sync.Mutex
+	cleanupRunning bool
+	cleanupDone    chan struct{}
+	cleaned        bool
 }
 
 func newSiriusReadOwner(execution SiriusExecution, runtime *SiriusRuntime) *siriusReadOwner {
 	return &siriusReadOwner{execution: execution, runtime: runtime, source: SiriusRuntimeFlight}
 }
 
-func newSiriusEmbeddedReadOwner(execution SiriusExecution, runtime *SiriusRuntime) *siriusReadOwner {
-	return &siriusReadOwner{execution: execution, runtime: runtime, source: runtime.Source}
+func newSiriusEmbeddedReadOwner(
+	execution SiriusExecution,
+	runtime *SiriusRuntime,
+	permit *siriusEmbeddedAdmissionPermit,
+) *siriusReadOwner {
+	return &siriusReadOwner{
+		execution: execution,
+		runtime:   runtime,
+		source:    runtime.Source,
+		permit:    permit,
+	}
 }
 
 func (o *siriusReadOwner) finish(ctx context.Context, succeeded bool) error {
 	if o == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !o.source.embedded() {
+		// Flight keeps its established cleanup behavior. Its execution object
+		// already owns retry/concurrent-close state; the outer embedded permit
+		// state machine is neither needed nor applied to it.
+		cleanupCtx, cancel := context.WithTimeoutCause(context.WithoutCancel(ctx), o.runtime.CleanupTimeout,
+			moerr.NewInternalErrorNoCtx("substrait: timed out cleaning up Sirius execution"))
+		defer cancel()
+		if succeeded {
+			return o.execution.CleanupAfterRun(cleanupCtx, nil)
+		}
+		return o.execution.Cleanup(cleanupCtx)
+	}
+	for {
+		o.cleanupMu.Lock()
+		if o.cleaned {
+			o.cleanupMu.Unlock()
+			return nil
+		}
+		if o.cleanupRunning {
+			done := o.cleanupDone
+			o.cleanupMu.Unlock()
+			select {
+			case <-done:
+				// A failed owner remains retryable; claim the next attempt.
+				continue
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			}
+		}
+		o.cleanupRunning = true
+		o.cleanupDone = make(chan struct{})
+		done := o.cleanupDone
+		o.cleanupMu.Unlock()
+
+		cleanupErr := o.cleanupAttempt(ctx, succeeded)
+		o.cleanupMu.Lock()
+		if cleanupErr == nil {
+			o.cleaned = true
+		}
+		o.cleanupRunning = false
+		close(done)
+		o.cleanupMu.Unlock()
+
+		if o.source.embedded() && cleanupErr != nil {
+			o.runtime.sealEmbeddedAdmission()
+		}
+		// Cleanup must complete (or fail and seal admission) before another
+		// embedded query can own the selected GPU. The permit is once-release,
+		// while a failed execution owner remains available for cleanup retry.
+		o.permit.release()
+		return cleanupErr
+	}
+}
+
+func (o *siriusReadOwner) cleanupAttempt(ctx context.Context, succeeded bool) (result error) {
 	cleanupCtx, cancel := context.WithTimeoutCause(context.WithoutCancel(ctx), o.runtime.CleanupTimeout,
 		moerr.NewInternalErrorNoCtx("substrait: timed out cleaning up Sirius execution"))
 	defer cancel()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = moerr.NewInternalErrorNoCtxf(
+				"substrait: panic cleaning up Sirius execution: %v", recovered)
+		}
+	}()
 	if succeeded {
 		return o.execution.CleanupAfterRun(cleanupCtx, nil)
 	}
@@ -326,7 +433,15 @@ func (r *SiriusRuntime) abortEmbeddedAdmittedRead(
 ) error {
 	cleanupCtx, cancel := context.WithTimeoutCause(context.WithoutCancel(ctx), r.CleanupTimeout,
 		moerr.NewInternalErrorNoCtx("substrait: timed out releasing embedded TAE admission"))
-	releaseErr := plan.Release(cleanupCtx, r.Leases)
+	releaseErr := func() (result error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result = moerr.NewInternalErrorNoCtxf(
+					"substrait: panic releasing embedded TAE admission: %v", recovered)
+			}
+		}()
+		return plan.Release(cleanupCtx, r.Leases)
+	}()
 	cancel()
 	if releaseErr == nil {
 		return cause
@@ -342,6 +457,33 @@ func (r *SiriusRuntime) sealEmbeddedRuntime(ctx context.Context, cause error) er
 		moerr.NewInternalErrorNoCtx("substrait: timed out sealing embedded Sirius runtime"))
 	defer cancel()
 	return errors.Join(cause, r.Close(cleanupCtx))
+}
+
+func (r *SiriusRuntime) sealEmbeddedAdmission() {
+	if r != nil && r.embeddedAdmission != nil {
+		r.embeddedAdmission.seal()
+	}
+}
+
+func (r *SiriusRuntime) prepareEmbeddedExecution(
+	ctx context.Context,
+	request SiriusPrepareRequest,
+) (SiriusExecution, error) {
+	execution, err := r.Backend.Prepare(ctx, request)
+	if err != nil {
+		if health, ok := r.Backend.(interface{ Accepting() bool }); ok && !health.Accepting() {
+			// A native cleanup failure can seal the backend while this Go permit
+			// is still active. Seal the outer queue before its deferred handoff.
+			r.sealEmbeddedAdmission()
+		}
+		return nil, err
+	}
+	if execution == nil {
+		r.sealEmbeddedAdmission()
+		return nil, moerr.NewInternalErrorNoCtx(
+			"substrait: embedded preparation returned no execution")
+	}
+	return execution, nil
 }
 
 func cloneReadRefs(readRefs [][]byte) [][]byte {

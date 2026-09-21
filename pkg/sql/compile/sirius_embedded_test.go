@@ -414,18 +414,19 @@ type siriusEmbeddedBackendStub struct {
 type siriusEmbeddedTAETestRelation struct {
 	*mock_frontend.MockRelation
 	tableDef *planpb.TableDef
+	visitErr error
 }
 
 func (*siriusEmbeddedTAETestRelation) CanVisitSnapshotLocally() (bool, error) { return true, nil }
 func (r *siriusEmbeddedTAETestRelation) GetTableDef(context.Context) *planpb.TableDef {
 	return r.tableDef
 }
-func (*siriusEmbeddedTAETestRelation) VisitSnapshotObjects(
+func (r *siriusEmbeddedTAETestRelation) VisitSnapshotObjects(
 	context.Context,
 	types.TS,
 	func(objectio.ObjectStats, bool) error,
 ) error {
-	return nil
+	return r.visitErr
 }
 func (*siriusEmbeddedTAETestRelation) HasSnapshotTombstones(
 	context.Context,
@@ -514,6 +515,7 @@ func TestEmbeddedSiriusPreparesBeforeOpeningRelations(t *testing.T) {
 		return execution, nil
 	}}
 	runtime := &SiriusRuntime{Source: SiriusRuntimeEmbeddedMO, Backend: backend, CleanupTimeout: time.Second}
+	require.NoError(t, runtime.InitEmbeddedAdmission(16))
 	serviceRuntime := moruntime.ServiceRuntime(proc.GetService())
 	serviceRuntime.SetGlobalVariables(SiriusRuntimeKey, runtime)
 	t.Cleanup(func() { serviceRuntime.CompareAndDeleteGlobalVariables(SiriusRuntimeKey, runtime) })
@@ -581,10 +583,14 @@ func TestEmbeddedTAEAdmissionPreparesNativeWithoutMOProducer(t *testing.T) {
 		name         string
 		prepareFail  bool
 		nilExecution bool
+		relationFail bool
+		admitFail    bool
 	}{
 		{name: "execution owns release"},
 		{name: "native prepare failure releases", prepareFail: true},
 		{name: "illegal nil execution seals runtime", nilExecution: true},
+		{name: "relation failure releases admission", relationFail: true},
+		{name: "storage admission failure releases admission", admitFail: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
@@ -605,13 +611,24 @@ func TestEmbeddedTAEAdmissionPreparesNativeWithoutMOProducer(t *testing.T) {
 				MockRelation: relationMock,
 				tableDef:     queryPlan.GetQuery().Nodes[0].TableDef,
 			}
+			if test.admitFail {
+				relation.visitErr = errors.New("snapshot visit failed")
+			}
 			var relationOpens atomic.Int32
-			storage.EXPECT().Database(gomock.Any(), "db", gomock.Any()).DoAndReturn(
-				func(context.Context, string, client.TxnOperator) (engine.Database, error) {
-					relationOpens.Add(1)
-					return database, nil
-				})
-			database.EXPECT().Relation(gomock.Any(), "t", gomock.Any()).Return(relation, nil)
+			if test.relationFail {
+				storage.EXPECT().Database(gomock.Any(), "db", gomock.Any()).DoAndReturn(
+					func(context.Context, string, client.TxnOperator) (engine.Database, error) {
+						relationOpens.Add(1)
+						return nil, errors.New("relation open failed")
+					})
+			} else {
+				storage.EXPECT().Database(gomock.Any(), "db", gomock.Any()).DoAndReturn(
+					func(context.Context, string, client.TxnOperator) (engine.Database, error) {
+						relationOpens.Add(1)
+						return database, nil
+					})
+				database.EXPECT().Relation(gomock.Any(), "t", gomock.Any()).Return(relation, nil)
+			}
 
 			proc := testutil.NewProcess(t)
 			t.Cleanup(proc.Free)
@@ -621,11 +638,13 @@ func TestEmbeddedTAEAdmissionPreparesNativeWithoutMOProducer(t *testing.T) {
 			require.NoError(t, leases.Replay(context.Background()))
 			var releases atomic.Int32
 			var closes atomic.Int32
+			var prepares atomic.Int32
 			var request SiriusPrepareRequest
 			backend := &siriusEmbeddedBackendStub{close: func(context.Context) error {
 				closes.Add(1)
 				return nil
 			}, prepare: func(ctx context.Context, req SiriusPrepareRequest) (SiriusExecution, error) {
+				prepares.Add(1)
 				request = req
 				require.Equal(t, int32(1), relationOpens.Load(), "storage admission precedes native preparation")
 				require.Len(t, req.Reads, 1)
@@ -656,6 +675,7 @@ func TestEmbeddedTAEAdmissionPreparesNativeWithoutMOProducer(t *testing.T) {
 				Source: SiriusRuntimeEmbeddedTAE, Backend: backend, Leases: leases,
 				DataDir: "/shared/tae", LeaseTTL: time.Minute, CleanupTimeout: time.Second,
 			}
+			require.NoError(t, runtime.InitEmbeddedAdmission(16))
 			serviceRuntime := moruntime.ServiceRuntime(proc.GetService())
 			serviceRuntime.SetGlobalVariables(SiriusRuntimeKey, runtime)
 			t.Cleanup(func() { serviceRuntime.CompareAndDeleteGlobalVariables(SiriusRuntimeKey, runtime) })
@@ -664,18 +684,36 @@ func TestEmbeddedTAEAdmissionPreparesNativeWithoutMOProducer(t *testing.T) {
 			offloaded, err := c.tryCompileSiriusRead(
 				WithSiriusOffload(defines.AttachAccountId(context.Background(), 7)), queryPlan,
 			)
+			if test.relationFail || test.admitFail {
+				require.False(t, offloaded)
+				if test.relationFail {
+					require.ErrorContains(t, err, "relation open failed")
+				} else {
+					require.ErrorContains(t, err, "snapshot visit failed")
+				}
+				require.Zero(t, prepares.Load())
+				permit, acquireErr := runtime.acquireEmbeddedAdmission(context.Background())
+				require.NoError(t, acquireErr, "pre-Prepare failure must release its permit")
+				permit.release()
+				c.Release()
+				return
+			}
 			if test.prepareFail {
 				require.False(t, offloaded)
 				require.ErrorContains(t, err, "native prepare failed")
 				require.Equal(t, int32(1), releases.Load())
 				require.Nil(t, c.siriusRead)
+				permit, acquireErr := runtime.acquireEmbeddedAdmission(context.Background())
+				require.NoError(t, acquireErr, "ordinary Prepare failure must release its permit")
+				permit.release()
 				c.Release()
 				return
 			}
 			if test.nilExecution {
 				require.False(t, offloaded)
 				require.ErrorContains(t, err, "returned no execution")
-				require.Equal(t, int32(1), closes.Load())
+				require.Zero(t, closes.Load(), "contract failure seals admission without racing backend cleanup")
+				require.False(t, runtime.embeddedAdmission.accepting())
 				require.Zero(t, releases.Load(), "compiler must not duplicate backend-owned release")
 				require.NoError(t, request.Release(context.Background()), "backend retry owner remains usable")
 				c.Release()
@@ -735,7 +773,7 @@ func TestEmbeddedSiriusCancellationJoinsBeforeRelease(t *testing.T) {
 	}
 	owner := newSiriusEmbeddedReadOwner(execution, &SiriusRuntime{
 		Source: SiriusRuntimeEmbeddedMO, CleanupTimeout: time.Second,
-	})
+	}, nil)
 	c.siriusRead = owner
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
