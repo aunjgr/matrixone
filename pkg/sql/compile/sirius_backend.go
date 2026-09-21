@@ -41,11 +41,21 @@ type SiriusPrepareRequest struct {
 	Reads       []SiriusReadDescriptor
 }
 
-// SiriusInput accepts MO-native vector buffers synchronously. It never retains
-// Go memory after Push returns. Producers are lazy and owned by the execution.
+// SiriusInput reserves native credit before MO materializes a range. Publish
+// copies synchronously and never retains Go memory. Producers are lazy and
+// owned by the execution.
 type SiriusInput interface {
-	Push(context.Context, uint32, []SiriusInputVector) error
+	Acquire(context.Context, uint64) (SiriusInputLease, error)
 	IsNotNeeded(error) bool
+}
+
+// SiriusInputLease owns native input credit before any range payload is
+// materialized. Publish copies synchronously; Release is idempotent and must
+// run on both publication success and failure.
+type SiriusInputLease interface {
+	Capacity() uint64
+	Publish(context.Context, uint32, []SiriusInputVector) error
+	Release() error
 }
 
 const (

@@ -120,7 +120,7 @@ func (s *service) startSiriusRuntime(ctx context.Context) error {
 		defer cancel()
 		return errors.Join(siriusInternalErrorf("substrait: start read resolver: %w", err), runtime.Close(cleanupCtx))
 	}
-	if err = runtime.ReconcileReplay(); err != nil {
+	if err = runtime.ReconcileReplay(ctx); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), config.CleanupTimeout.Duration)
 		defer cancel()
 		return errors.Join(err, runtime.Close(cleanupCtx))

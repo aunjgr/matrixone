@@ -17,6 +17,7 @@ package cnservice
 import (
 	"context"
 	"encoding/binary"
+	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -67,7 +68,13 @@ func validateSiriusEmbeddedConfig(c *SiriusConfig) error {
 	return (siriusbridge.Config{ConfigPath: c.NativeConfigPath, GPUStreams: c.GPUStreams, MaxWaiting: c.MaxWaitingQueries, CleanupTimeout: c.CleanupTimeout.Duration}).Validate()
 }
 
-type embeddedBackend struct{ native *siriusbridge.Runtime }
+type embeddedRuntime interface {
+	Accepting() bool
+	Close(context.Context) error
+	Prepare(context.Context, siriusbridge.Request) (*siriusbridge.Query, error)
+}
+
+type embeddedBackend struct{ native embeddedRuntime }
 
 func (b *embeddedBackend) Accepting() bool { return b.native.Accepting() }
 
@@ -96,41 +103,76 @@ func (b *embeddedBackend) Prepare(ctx context.Context, req compile.SiriusPrepare
 		nativeReq.Reads = append(nativeReq.Reads, r)
 	}
 	q, err := b.native.Prepare(ctx, nativeReq)
+	discardPreparedReadDescriptors(nativeReq.Reads)
 	if err != nil {
 		return nil, err
 	}
-	return &embeddedExecution{query: q, request: req}, nil
+	outputTypes := make([]types.Type, len(req.OutputTypes))
+	for i, t := range req.OutputTypes {
+		outputTypes[i] = types.New(types.T(t.Id), t.Width, t.Scale)
+	}
+	headings := make([]string, len(req.Headings))
+	for i, heading := range req.Headings {
+		headings[i] = strings.Clone(heading)
+	}
+	return &embeddedExecution{query: q, outputTypes: outputTypes, headings: headings}, nil
+}
+
+// Native preparation synchronously copies the read descriptors. The bridge
+// query shares this temporary slice only to start MO producers later, so retain
+// no storage descriptor after Prepare returns.
+func discardPreparedReadDescriptors(reads []siriusbridge.Read) {
+	for i := range reads {
+		bindingID, producer := reads[i].BindingID, reads[i].Producer
+		reads[i] = siriusbridge.Read{}
+		if producer != nil {
+			reads[i].BindingID = bindingID
+			reads[i].Producer = producer
+		}
+	}
 }
 
 type embeddedInput struct{ input *siriusbridge.Input }
 
-func (i embeddedInput) Push(ctx context.Context, rows uint32, vs []compile.SiriusInputVector) error {
+func (i embeddedInput) Acquire(ctx context.Context, bytes uint64) (compile.SiriusInputLease, error) {
+	lease, err := i.input.Acquire(ctx, bytes)
+	if err != nil {
+		return nil, err
+	}
+	return embeddedInputLease{lease}, nil
+}
+
+type embeddedInputLease struct{ lease *siriusbridge.InputLease }
+
+func (l embeddedInputLease) Capacity() uint64 { return l.lease.Capacity() }
+func (l embeddedInputLease) Release() error   { return l.lease.Release() }
+func (l embeddedInputLease) Publish(ctx context.Context, rows uint32, vs []compile.SiriusInputVector) error {
 	vectors := make([]siriusbridge.Vector, len(vs))
 	for n, v := range vs {
 		vectors[n] = siriusbridge.Vector{Class: v.Class, Data: v.Data, Area: v.Area, Nulls: v.Nulls}
 	}
-	return i.input.Push(ctx, rows, vectors)
+	return l.lease.Publish(ctx, rows, vectors)
 }
 
 func (i embeddedInput) IsNotNeeded(err error) bool { return i.input.IsNotNeeded(err) }
 
 type embeddedExecution struct {
-	query   *siriusbridge.Query
-	request compile.SiriusPrepareRequest
+	query       *siriusbridge.Query
+	outputTypes []types.Type
+	headings    []string
 }
 
 func (e *embeddedExecution) Run(ctx context.Context, mp *mpool.MPool, counters *perfcounter.CounterSet, fill func(*batch.Batch, *perfcounter.CounterSet) error) error {
 	return e.query.Run(ctx, func(result siriusbridge.Result) error {
-		if len(result.Vectors) != len(e.request.OutputTypes) {
+		if len(result.Vectors) != len(e.outputTypes) {
 			return moerr.NewInvalidInputNoCtx("Sirius output schema mismatch")
 		}
 		bat := batch.NewWithSize(len(result.Vectors))
 		defer bat.Clean(mp)
-		bat.Attrs = e.request.Headings
+		bat.Attrs = e.headings
 		bat.SetRowCount(int(result.Rows))
 		for i, v := range result.Vectors {
-			t := e.request.OutputTypes[i]
-			typ := types.New(types.T(t.Id), t.Width, t.Scale)
+			typ := e.outputTypes[i]
 			if v.Class != 0 || uint64(len(v.Data)) != uint64(result.Rows)*uint64(typ.TypeSize()) || len(v.Nulls)%8 != 0 {
 				return moerr.NewInvalidInputNoCtx("invalid Sirius native vector layout")
 			}
@@ -158,3 +200,4 @@ func (e *embeddedExecution) CleanupAfterRun(ctx context.Context, _ error) error 
 
 var _ compile.SiriusBackend = (*embeddedBackend)(nil)
 var _ compile.SiriusExecution = (*embeddedExecution)(nil)
+var _ embeddedRuntime = (*siriusbridge.Runtime)(nil)

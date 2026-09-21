@@ -95,15 +95,12 @@ func (r *SiriusRuntime) Validate() error {
 		return moerr.NewInternalErrorNoCtx("substrait: incomplete CN Sirius runtime")
 	}
 	if r.Source.embedded() {
-		if r.Backend == nil || r.CleanupTimeout <= 0 {
-			return moerr.NewInternalErrorNoCtx("substrait: incomplete embedded Sirius runtime")
-		}
 		if r.BenchmarkNoGC {
 			return moerr.NewInternalErrorNoCtx("substrait: embedded Sirius cannot use benchmark lease mode")
 		}
 		if r.Source == SiriusRuntimeEmbeddedTAE &&
 			(r.Leases == nil || !r.Leases.DurableReady() || r.DataDir == "" ||
-				r.LeaseTTL <= 0 || r.LeaseTTL > substrait.MaxLeaseTTL) {
+				r.LeaseTTL <= r.CleanupTimeout || r.LeaseTTL > substrait.MaxLeaseTTL) {
 			return moerr.NewInternalErrorNoCtx("substrait: incomplete embedded TAE Sirius runtime")
 		}
 		if health, ok := r.Backend.(interface{ Accepting() bool }); ok && !health.Accepting() {
@@ -113,7 +110,7 @@ func (r *SiriusRuntime) Validate() error {
 	}
 	if r.Source != SiriusRuntimeFlight || r.Leases == nil ||
 		r.Resolver == nil || !nonzeroSiriusSPKI(r.AuthorizedClientSPKIHash) || r.DataDir == "" ||
-		r.LeaseTTL <= 0 || r.LeaseTTL > substrait.MaxLeaseTTL || r.CleanupTimeout <= 0 {
+		r.LeaseTTL <= r.CleanupTimeout || r.LeaseTTL > substrait.MaxLeaseTTL {
 		return moerr.NewInternalErrorNoCtx("substrait: incomplete CN Sirius runtime")
 	}
 	if r.BenchmarkNoGC {
@@ -316,6 +313,35 @@ func (r *SiriusRuntime) recoverAdmittedRead(ctx context.Context, accountID uint6
 		return releaseReadRefs(releaseCtx, r.Leases, readRefs)
 	})
 	return errors.Join(releaseErr, reconcileErr)
+}
+
+// abortEmbeddedAdmittedRead handles the narrow invariant-failure window after
+// embedded TAE admission but before Backend.Prepare owns Release. A failed
+// local release seals native admission; durable protection remains for restart
+// reconciliation rather than being left behind an accepting runtime.
+func (r *SiriusRuntime) abortEmbeddedAdmittedRead(
+	ctx context.Context,
+	plan *SiriusReadPlan,
+	cause error,
+) error {
+	cleanupCtx, cancel := context.WithTimeoutCause(context.WithoutCancel(ctx), r.CleanupTimeout,
+		moerr.NewInternalErrorNoCtx("substrait: timed out releasing embedded TAE admission"))
+	releaseErr := plan.Release(cleanupCtx, r.Leases)
+	cancel()
+	if releaseErr == nil {
+		return cause
+	}
+	return errors.Join(cause, releaseErr, r.sealEmbeddedRuntime(ctx, nil))
+}
+
+func (r *SiriusRuntime) sealEmbeddedRuntime(ctx context.Context, cause error) error {
+	if r == nil {
+		return errors.Join(cause, moerr.NewInternalErrorNoCtx("substrait: cannot seal a nil embedded runtime"))
+	}
+	cleanupCtx, cancel := context.WithTimeoutCause(context.WithoutCancel(ctx), r.CleanupTimeout,
+		moerr.NewInternalErrorNoCtx("substrait: timed out sealing embedded Sirius runtime"))
+	defer cancel()
+	return errors.Join(cause, r.Close(cleanupCtx))
 }
 
 func cloneReadRefs(readRefs [][]byte) [][]byte {

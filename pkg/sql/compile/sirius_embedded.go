@@ -15,9 +15,9 @@
 package compile
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -35,6 +35,8 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/output"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine"
+	disttaesidecar "github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/sidecar"
 )
 
 const (
@@ -44,8 +46,10 @@ const (
 )
 
 type siriusEmbeddedPlan struct {
-	request SiriusPrepareRequest
-	reads   []substrait.EmbeddedMORead
+	request   SiriusPrepareRequest
+	reads     []substrait.EmbeddedMORead
+	candidate *substrait.Candidate
+	taeReads  []substrait.Read
 }
 
 // buildSiriusEmbeddedPlan is pure except for reading the already-open
@@ -92,8 +96,7 @@ func (c *Compile) buildSiriusEmbeddedPlan(
 		return nil, err
 	}
 	statementID := c.proc.GetStmtProfile().GetStmtId()
-	queryID := make([]byte, hex.EncodedLen(len(statementID)))
-	hex.Encode(queryID, statementID[:])
+	queryID := append([]byte(nil), statementID[:]...)
 	request := SiriusPrepareRequest{
 		AccountID:   uint64(accountID),
 		QueryID:     queryID,
@@ -129,11 +132,136 @@ func (c *Compile) buildSiriusEmbeddedPlan(
 	return &siriusEmbeddedPlan{request: request, reads: reads}, nil
 }
 
+// buildSiriusEmbeddedTAEPlan finishes every pure plan and descriptor decision
+// before the caller opens a relation or asks storage to protect a snapshot.
+func (c *Compile) buildSiriusEmbeddedTAEPlan(
+	ctx context.Context,
+	queryPlan *planpb.Plan,
+) (*siriusEmbeddedPlan, error) {
+	if c == nil || c.proc == nil || queryPlan == nil || queryPlan.GetQuery() == nil {
+		return nil, moerr.NewInternalError(ctx, "substrait: embedded TAE compile has no SELECT plan")
+	}
+	candidate, err := substrait.Export(queryPlan.GetQuery())
+	if err != nil {
+		return nil, err
+	}
+	reads := candidate.Reads()
+	if len(reads) == 0 || len(reads) > siriusMaxReads {
+		return nil, substrait.NotEligible(substrait.EligibilityPlanShape,
+			"embedded TAE read count is unsupported")
+	}
+
+	txnOp := c.proc.GetTxnOperator()
+	if txnOp == nil || txnOp.GetWorkspace() == nil {
+		return nil, moerr.NewInternalError(ctx, "substrait: embedded TAE compile has no transaction workspace")
+	}
+	workspace := txnOp.GetWorkspace()
+	if !workspace.Readonly() || workspace.WriteOffset() != 0 || workspace.GetSnapshotWriteOffset() != 0 {
+		return nil, substrait.NotEligible(substrait.EligibilityTransaction,
+			"embedded TAE input requires a read-only snapshot without prior writes")
+	}
+	snapshotTS := types.TimestampToTS(txnOp.SnapshotTS())
+	snapshot, err := snapshotTS.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshot) != 12 {
+		return nil, moerr.NewInternalErrorNoCtxf(
+			"substrait: embedded TAE snapshot has %d bytes, want 12", len(snapshot))
+	}
+	accountID, err := defines.GetAccountId(ctx)
+	if err != nil {
+		return nil, err
+	}
+	statementID := c.proc.GetStmtProfile().GetStmtId()
+	queryID := append([]byte(nil), statementID[:]...)
+	request := SiriusPrepareRequest{
+		AccountID: uint64(accountID), QueryID: queryID,
+		OutputTypes: candidate.OutputTypes(),
+		Headings:    append([]string(nil), queryPlan.GetQuery().Headings...),
+		Reads:       make([]SiriusReadDescriptor, len(reads)),
+	}
+	copy(request.Snapshot[:], snapshot)
+	bindings := make(map[int32]substrait.EmbeddedReadBinding, len(reads))
+	for i, read := range reads {
+		bindingID := uint64(i + 1)
+		descriptor, descriptorErr := embeddedTAEReadDescriptor(queryPlan.GetQuery(), read, bindingID)
+		if descriptorErr != nil {
+			return nil, descriptorErr
+		}
+		request.Reads[i] = descriptor
+		bindings[read.NodeID] = substrait.EmbeddedReadBinding{
+			BindingID: bindingID,
+			Source:    substrait.EmbeddedReadTAE,
+		}
+	}
+	request.Plan, err = candidate.BuildEmbedded(bindings)
+	if err != nil {
+		return nil, err
+	}
+	return &siriusEmbeddedPlan{request: request, candidate: candidate, taeReads: reads}, nil
+}
+
+func embeddedTAEReadDescriptor(
+	query *planpb.Query,
+	read substrait.Read,
+	bindingID uint64,
+) (SiriusReadDescriptor, error) {
+	if query == nil || read.NodeID < 0 || int(read.NodeID) >= len(query.Nodes) {
+		return SiriusReadDescriptor{}, moerr.NewInternalErrorNoCtx("substrait: embedded TAE scan node is missing")
+	}
+	node := query.Nodes[read.NodeID]
+	if node == nil || node.NodeId != read.NodeID || node.NodeType != planpb.Node_TABLE_SCAN ||
+		node.ObjRef == nil || node.TableDef == nil {
+		return SiriusReadDescriptor{}, moerr.NewInternalErrorNoCtx("substrait: embedded TAE scan identity is invalid")
+	}
+	descriptor := SiriusReadDescriptor{
+		BindingID: bindingID,
+		Database:  node.ObjRef.DbName,
+		Table:     node.ObjRef.ObjName,
+		Schema:    node.ObjRef.SchemaName,
+		Columns:   make([]SiriusReadColumn, 0, len(read.Columns)),
+	}
+	if descriptor.Database == "" {
+		descriptor.Database = node.TableDef.DbName
+	}
+	if descriptor.Table == "" {
+		descriptor.Table = node.TableDef.Name
+	}
+	for _, column := range node.TableDef.Cols {
+		if column == nil {
+			return SiriusReadDescriptor{}, moerr.NewInternalErrorNoCtx("substrait: embedded TAE table has a nil column")
+		}
+		if column.Hidden {
+			continue
+		}
+		position := len(descriptor.Columns)
+		if position >= len(read.Columns) || read.Columns[position].ColumnID != column.ColId ||
+			read.Columns[position].SequenceNumber != column.Seqnum {
+			return SiriusReadDescriptor{}, moerr.NewInternalErrorNoCtx("substrait: embedded TAE physical schema changed during planning")
+		}
+		descriptor.Columns = append(descriptor.Columns, SiriusReadColumn{
+			Type: column.Typ, Name: column.Name,
+			PhysicalID: column.ColId, Sequence: column.Seqnum,
+		})
+	}
+	if len(descriptor.Columns) != len(read.Columns) {
+		return SiriusReadDescriptor{}, moerr.NewInternalErrorNoCtx("substrait: embedded TAE descriptor width mismatch")
+	}
+	return descriptor, nil
+}
+
 func (c *Compile) tryCompileEmbeddedSiriusRead(
 	ctx context.Context,
 	queryPlan *planpb.Plan,
 	runtime *SiriusRuntime,
 ) (bool, error) {
+	if runtime.Source == SiriusRuntimeEmbeddedTAE {
+		return c.tryCompileEmbeddedTAESiriusRead(ctx, queryPlan, runtime)
+	}
+	if runtime.Source != SiriusRuntimeEmbeddedMO {
+		return false, moerr.NewInternalErrorNoCtx("substrait: invalid embedded Sirius read source")
+	}
 	plan, err := c.buildSiriusEmbeddedPlan(ctx, queryPlan)
 	if err != nil {
 		return false, err
@@ -192,6 +320,79 @@ func (c *Compile) tryCompileEmbeddedSiriusRead(
 			return c.runOnce()
 		})
 	})
+	c.siriusRead = newSiriusEmbeddedReadOwner(execution, runtime)
+	return true, nil
+}
+
+func (c *Compile) tryCompileEmbeddedTAESiriusRead(
+	ctx context.Context,
+	queryPlan *planpb.Plan,
+	runtime *SiriusRuntime,
+) (bool, error) {
+	plan, err := c.buildSiriusEmbeddedTAEPlan(ctx, queryPlan)
+	if err != nil {
+		return false, err
+	}
+
+	relations := make(map[uint64]engine.Relation, len(plan.taeReads))
+	for _, read := range plan.taeReads {
+		node := queryPlan.GetQuery().Nodes[read.NodeID]
+		relation, _, _, openErr := c.handleDbRelContext(node, false)
+		if openErr != nil {
+			return false, moerr.NewInternalErrorf(ctx,
+				"substrait: open embedded TAE table %d: %v", read.TableID, openErr)
+		}
+		relations[read.TableID] = relation
+	}
+	txnOp := c.proc.GetTxnOperator()
+	workspace := txnOp.GetWorkspace()
+	provider := &disttaesidecar.SnapshotProvider{
+		Relations: relations, MPool: c.proc.Mp(), DataDir: runtime.DataDir,
+		TxnOffset: workspace.GetSnapshotWriteOffset(),
+	}
+	admitted, err := substrait.AdmitReads(ctx, substrait.AdmissionRequest{
+		Candidate: plan.candidate, Provider: provider, Leases: runtime.Leases,
+		AccountID: plan.request.AccountID, QueryID: plan.request.QueryID,
+		SnapshotTS: plan.request.Snapshot[:], Consumer: substrait.ReadConsumerEmbeddedTAE,
+		TTL: runtime.LeaseTTL, ReadOnly: workspace.Readonly(),
+		PriorWrites: workspace.WriteOffset() != 0 || workspace.GetSnapshotWriteOffset() != 0,
+	})
+	if err != nil {
+		return false, err
+	}
+	readOwner := &SiriusReadPlan{
+		ReadRefs: cloneReadRefs(admitted.ReadRefs), LeaseExpiresAt: admitted.ExpiresAt,
+	}
+	for i, read := range plan.taeReads {
+		metadata, ok := admitted.EmbeddedTAEReads[read.NodeID]
+		if !ok || len(metadata.Manifest) == 0 ||
+			!bytes.Equal(metadata.CanonicalSchema, read.Schema) {
+			cause := moerr.NewInternalErrorNoCtx(
+				"substrait: admitted embedded TAE descriptor is unavailable or stale")
+			return false, runtime.abortEmbeddedAdmittedRead(ctx, readOwner, cause)
+		}
+		// AdmitReads lends these bytes until Release. Native Prepare copies them
+		// synchronously, after which the execution owner retains only the lease.
+		plan.request.Reads[i].TAEManifest = metadata.Manifest
+		plan.request.Reads[i].DataRoot = runtime.DataDir
+	}
+	plan.request.Deadline = admitted.ExpiresAt.Add(-runtime.CleanupTimeout)
+	plan.request.Release = func(releaseCtx context.Context) error {
+		return readOwner.Release(releaseCtx, runtime.Leases)
+	}
+	execution, err := runtime.Backend.Prepare(ctx, plan.request)
+	if err != nil {
+		// Prepare owns Release on every return once called. The embedded bridge
+		// retains failed cleanup for retry rather than exposing an unsafe fallback.
+		return false, err
+	}
+	if execution == nil {
+		// Prepare owns Release once called, including an invalid nil-success
+		// return. Do not race or duplicate the backend's retryable cleanup.
+		cause := moerr.NewInternalErrorNoCtx(
+			"substrait: embedded TAE preparation returned no execution")
+		return false, runtime.sealEmbeddedRuntime(ctx, cause)
+	}
 	c.siriusRead = newSiriusEmbeddedReadOwner(execution, runtime)
 	return true, nil
 }
@@ -445,22 +646,120 @@ func pushSiriusBatch(
 		if err = ctx.Err(); err != nil {
 			return context.Cause(ctx)
 		}
-		vectors, release, err := encodeSiriusBatchRange(bat, rows.start, rows.end, rows.compact, mp)
+		payloadBytes, err := siriusBatchRangePayloadBytes(bat, rows.start, rows.end, rows.compact)
 		if err != nil {
 			return err
 		}
-		err = func() error {
+		lease, err := input.Acquire(ctx, payloadBytes)
+		if err != nil {
+			return err
+		}
+		err = func() (result error) {
+			defer func() { result = errors.Join(result, lease.Release()) }()
+			vectors, release, encodeErr := encodeSiriusBatchRange(bat, rows.start, rows.end, rows.compact, mp)
+			if encodeErr != nil {
+				return encodeErr
+			}
 			defer release()
+			actual, sizeErr := siriusInputVectorsPayloadBytes(vectors)
+			if sizeErr != nil {
+				return sizeErr
+			}
+			if actual > payloadBytes || actual > lease.Capacity() {
+				return moerr.NewInternalErrorNoCtx("Sirius input encoding exceeded reserved native credit")
+			}
 			if contextErr := ctx.Err(); contextErr != nil {
 				return context.Cause(ctx)
 			}
-			return input.Push(ctx, uint32(rows.end-rows.start), vectors)
+			return lease.Publish(ctx, uint32(rows.end-rows.start), vectors)
 		}()
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// siriusBatchRangePayloadBytes is a size-only pass. Native Acquire remains the
+// authoritative hard gate because allocator rounding and descriptor charges
+// are owned below this raw payload contract.
+func siriusBatchRangePayloadBytes(
+	bat *batch.Batch,
+	start, end int,
+	compact bool,
+) (uint64, error) {
+	if bat == nil || start < 0 || end <= start || end > bat.RowCount() {
+		return 0, moerr.NewInvalidInputNoCtx("invalid Sirius input row range")
+	}
+	whole := start == 0 && end == bat.RowCount()
+	var total uint64
+	add := func(bytes uint64) error {
+		if bytes > siriusInputWindowBytes-total {
+			return moerr.NewInvalidInputNoCtx("Sirius input range exceeds native window")
+		}
+		total += bytes
+		return nil
+	}
+	for _, source := range bat.Vecs {
+		if source == nil || source.IsConstNull() {
+			continue
+		}
+		rows := end - start
+		physicalRows := rows
+		if source.IsConst() {
+			physicalRows = 1
+		}
+		cloneVarlen := source.GetType().IsVarlen() && (!whole || compact)
+		if cloneVarlen {
+			if err := add(uint64(physicalRows * source.GetType().TypeSize())); err != nil {
+				return 0, err
+			}
+			descriptors, _ := vector.MustVarlenaRawData(source)
+			for row := 0; row < physicalRows; row++ {
+				logicalRow := start + row
+				if source.IsConst() {
+					logicalRow = 0
+				}
+				if source.IsNull(uint64(logicalRow)) || descriptors[logicalRow].IsSmall() {
+					continue
+				}
+				_, size := descriptors[logicalRow].OffsetLen()
+				if err := add(uint64(size)); err != nil {
+					return 0, err
+				}
+			}
+		} else {
+			dataBytes := uint64(len(source.GetData()))
+			if !source.IsConst() && !whole {
+				dataBytes = uint64(rows * source.GetType().TypeSize())
+			}
+			if err := add(dataBytes); err != nil {
+				return 0, err
+			}
+			if err := add(uint64(len(source.GetArea()))); err != nil {
+				return 0, err
+			}
+		}
+		if !source.IsConst() {
+			if err := add(uint64(((rows + 63) / 64) * 8)); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return total, nil
+}
+
+func siriusInputVectorsPayloadBytes(vectors []SiriusInputVector) (uint64, error) {
+	var total uint64
+	for _, vector := range vectors {
+		for _, data := range [][]byte{vector.Data, vector.Area, vector.Nulls} {
+			if uint64(len(data)) > siriusInputWindowBytes-total {
+				return 0, moerr.NewInvalidInputNoCtx("Sirius input range exceeds native window")
+			}
+			total += uint64(len(data))
+		}
+	}
+	return total, nil
 }
 
 func pushSiriusOutputBatch(
@@ -479,8 +778,9 @@ func pushSiriusOutputBatch(
 }
 
 // splitSiriusBatch performs one linear pass over the logical cells. It targets
-// 32 MiB units, permits one large row up to the 64 MiB native window, and
-// rejects a row that can never make progress within that window.
+// 32 MiB raw-payload units and isolates a larger row below the raw 64 MiB
+// ceiling. Native Acquire is the exact hard gate because it also owns allocator
+// rounding and per-column descriptor charges.
 func splitSiriusBatch(bat *batch.Batch) ([]siriusBatchRange, error) {
 	return splitSiriusBatchAt(bat, siriusInputTargetBytes, siriusInputWindowBytes)
 }
@@ -626,9 +926,13 @@ func encodeSiriusBatchRange(
 	}
 	for i, source := range bat.Vecs {
 		vec := source
-		if (!whole || compact) && source.GetType().IsVarlen() {
+		if !source.IsConstNull() && (!whole || compact) && source.GetType().IsVarlen() {
 			var err error
-			vec, err = source.CloneWindow(start, end, mp)
+			cloneStart, cloneEnd := start, end
+			if source.IsConst() {
+				cloneStart, cloneEnd = 0, 1
+			}
+			vec, err = source.CloneWindow(cloneStart, cloneEnd, mp)
 			if err != nil {
 				release()
 				return nil, func() {}, err

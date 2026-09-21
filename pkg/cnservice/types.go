@@ -101,9 +101,9 @@ const (
 	ReservedTasks = 2
 )
 
-// SiriusConfig enables the explicit /*+ SIDECAR */ Substrait/Flight path.
-// Certificate files are deliberately separate for the two mTLS directions:
-// CN -> Flight and sidecar -> CN read resolver.
+// SiriusConfig enables the explicit /*+ SIDECAR */ Flight or embedded path.
+// Certificate files apply only to Flight's two mTLS directions: CN -> Flight
+// and sidecar -> CN read resolver.
 type SiriusConfig struct {
 	Enabled bool `toml:"enabled"`
 	// Backend defaults to Flight during migration. Embedded selection remains

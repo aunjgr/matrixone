@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +37,20 @@ import (
 )
 
 type siriusRuntimeTestProtector struct{ failUnregister bool }
+
+type siriusDurableJournalStub struct{}
+
+func (siriusDurableJournalStub) StoreIfCapacity(_ context.Context, leases []*substrait.Lease, _ int) (int, error) {
+	return len(leases), nil
+}
+func (siriusDurableJournalStub) Active(context.Context, *substrait.Lease) (bool, error) {
+	return false, nil
+}
+func (siriusDurableJournalStub) MarkReleased(context.Context, []byte) error { return nil }
+func (siriusDurableJournalStub) Delete(context.Context, []byte) error       { return nil }
+func (siriusDurableJournalStub) Load(context.Context, func(*substrait.Lease) error) error {
+	return nil
+}
 
 func (*siriusRuntimeTestProtector) Begin(context.Context) (
 	func(context.Context, []byte, []string, time.Time) error,
@@ -60,6 +75,15 @@ func (p siriusRuntimeTestProvider) PrepareSnapshotRead(context.Context, substrai
 	return substrait.SnapshotFacts{Manifest: []byte("manifest"), CanonicalSchema: p.schema}, nil
 }
 
+func (p siriusRuntimeTestProvider) PrepareSnapshotReadBounded(
+	ctx context.Context,
+	read substrait.Read,
+	snapshot []byte,
+	_ int,
+) (substrait.SnapshotFacts, error) {
+	return p.PrepareSnapshotRead(ctx, read, snapshot)
+}
+
 func TestSiriusRuntimeValidationAndLookup(t *testing.T) {
 	require.Error(t, (*SiriusRuntime)(nil).Validate())
 	require.NoError(t, (*SiriusRuntime)(nil).Close(context.Background()))
@@ -67,7 +91,7 @@ func TestSiriusRuntimeValidationAndLookup(t *testing.T) {
 	nondurable := substrait.NewLeaseManager(1, &siriusRuntimeTestProtector{})
 	invalid := &SiriusRuntime{
 		Backend: NewSiriusFlightBackend(&sidecarflight.Runtime{}), Leases: nondurable, Resolver: &substrait.ResolverServer{},
-		AuthorizedClientSPKIHash: make([]byte, 32), DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+		AuthorizedClientSPKIHash: bytes.Repeat([]byte{1}, 32), DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
 	}
 	require.Error(t, invalid.Validate())
 	benchmark := *invalid
@@ -78,15 +102,30 @@ func TestSiriusRuntimeValidationAndLookup(t *testing.T) {
 	wrongNormalMode := benchmark
 	wrongNormalMode.BenchmarkNoGC = false
 	require.ErrorContains(t, wrongNormalMode.Validate(), "incomplete CN Sirius runtime")
-	leases := substrait.NewPersistentLeaseManager(1, &siriusRuntimeTestProtector{}, siriusJournalStub{})
+	leases := substrait.NewPersistentLeaseManager(1, &siriusRuntimeTestProtector{}, siriusDurableJournalStub{})
 	require.NoError(t, leases.Replay(context.Background()))
 	valid := &SiriusRuntime{
 		Backend:  NewSiriusFlightBackend(&sidecarflight.Runtime{}),
 		Leases:   leases,
-		Resolver: &substrait.ResolverServer{}, AuthorizedClientSPKIHash: make([]byte, 32),
+		Resolver: &substrait.ResolverServer{}, AuthorizedClientSPKIHash: bytes.Repeat([]byte{1}, 32),
 		DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
 	}
 	require.NoError(t, valid.Validate())
+	zeroSPKI := *valid
+	zeroSPKI.AuthorizedClientSPKIHash = make([]byte, 32)
+	require.ErrorContains(t, zeroSPKI.Validate(), "incomplete CN Sirius runtime")
+	embeddedMO := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedMO, Backend: &siriusAdmissionBackend{accepting: true},
+		CleanupTimeout: time.Second,
+	}
+	require.NoError(t, embeddedMO.Validate())
+	embeddedTAE := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedTAE, Backend: &siriusAdmissionBackend{accepting: true},
+		Leases: leases, DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+	}
+	require.NoError(t, embeddedTAE.Validate())
+	embeddedTAE.Leases = nondurable
+	require.ErrorContains(t, embeddedTAE.Validate(), "incomplete embedded TAE Sirius runtime")
 	wrongBenchmarkMode := *valid
 	wrongBenchmarkMode.BenchmarkNoGC = true
 	require.ErrorContains(t, wrongBenchmarkMode.Validate(), "incomplete benchmark CN Sirius runtime")
@@ -109,6 +148,123 @@ func TestSiriusRuntimeValidationAndLookup(t *testing.T) {
 	require.True(t, rt.CompareAndDeleteGlobalVariables(SiriusRuntimeKey, valid))
 }
 
+type siriusReconcileBackend struct {
+	reconciled int
+}
+
+func (*siriusReconcileBackend) Prepare(context.Context, SiriusPrepareRequest) (SiriusExecution, error) {
+	return nil, errors.New("not used")
+}
+func (b *siriusReconcileBackend) Reconcile(_ uint64, _ []byte, release func(context.Context) error) error {
+	b.reconciled++
+	return release(context.Background())
+}
+func (*siriusReconcileBackend) Close(context.Context) error            { return nil }
+func (*siriusReconcileBackend) CanFallbackBeforeVisibility(error) bool { return false }
+
+func TestSiriusReplayReconcilesOnlyFlightAndEmbeddedTAERejectsIt(t *testing.T) {
+	query := &planpb.Query{
+		StmtType: planpb.Query_SELECT, Steps: []int32{0}, Headings: []string{"a"},
+		Nodes: []*planpb.Node{{
+			NodeId: 0, NodeType: planpb.Node_TABLE_SCAN,
+			ObjRef: &planpb.ObjectRef{Obj: 42, ObjName: "t"},
+			TableDef: &planpb.TableDef{DbId: 7, TblId: 42, Version: 3, Name: "t", TableType: "r", Cols: []*planpb.ColDef{{
+				Name: "a", ColId: 11, Seqnum: 5, Typ: planpb.Type{Id: int32(types.T_int64)},
+			}}},
+		}},
+	}
+	candidate, err := substrait.Export(query)
+	require.NoError(t, err)
+	provider := siriusRuntimeTestProvider{schema: candidate.Reads()[0].Schema}
+	newManager := func() *substrait.LeaseManager {
+		manager := substrait.NewPersistentLeaseManager(2, &siriusRuntimeTestProtector{}, siriusDurableJournalStub{})
+		require.NoError(t, manager.Replay(context.Background()))
+		return manager
+	}
+	admit := func(manager *substrait.LeaseManager, consumer substrait.ReadConsumer, queryID byte) {
+		request := substrait.AdmissionRequest{
+			Candidate: candidate, Provider: provider, Leases: manager, AccountID: 1,
+			QueryID: bytes.Repeat([]byte{queryID}, 16), SnapshotTS: make([]byte, 12),
+			Consumer: consumer, TTL: time.Minute, ReadOnly: true,
+		}
+		if consumer == substrait.ReadConsumerFlight {
+			request.AuthorizedClientSPKIHash = bytes.Repeat([]byte{1}, 32)
+		}
+		_, admitErr := substrait.AdmitReads(context.Background(), request)
+		require.NoError(t, admitErr)
+	}
+
+	flightManager := newManager()
+	admit(flightManager, substrait.ReadConsumerFlight, 'f')
+	admit(flightManager, substrait.ReadConsumerEmbeddedTAE, 'e')
+	backend := new(siriusReconcileBackend)
+	flight := &SiriusRuntime{
+		Backend: backend, Leases: flightManager, Resolver: &substrait.ResolverServer{},
+		AuthorizedClientSPKIHash: bytes.Repeat([]byte{1}, 32), DataDir: t.TempDir(),
+		LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+	}
+	require.NoError(t, flight.ReconcileReplay(context.Background()))
+	require.Equal(t, 1, backend.reconciled, "only the Flight group is handed to the backend")
+	require.Empty(t, flightManager.PendingExecutions())
+
+	embeddedManager := newManager()
+	admit(embeddedManager, substrait.ReadConsumerFlight, 'x')
+	embedded := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedTAE, Backend: new(siriusReconcileBackend),
+		Leases: embeddedManager, DataDir: t.TempDir(), LeaseTTL: time.Minute,
+		CleanupTimeout: time.Second,
+	}
+	require.ErrorContains(t, embedded.ReconcileReplay(context.Background()), "unreconciled Flight reads")
+
+	mo := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedMO, Backend: new(siriusReconcileBackend), CleanupTimeout: time.Second,
+	}
+	require.NoError(t, mo.ReconcileReplay(context.Background()))
+}
+
+func TestEmbeddedTAEAbortSealsRuntimeWhenLocalReleaseNeedsRetry(t *testing.T) {
+	query := &planpb.Query{
+		StmtType: planpb.Query_SELECT, Steps: []int32{0}, Headings: []string{"a"},
+		Nodes: []*planpb.Node{{
+			NodeId: 0, NodeType: planpb.Node_TABLE_SCAN,
+			ObjRef: &planpb.ObjectRef{Obj: 42, ObjName: "t"},
+			TableDef: &planpb.TableDef{DbId: 7, TblId: 42, Version: 3, Name: "t", TableType: "r", Cols: []*planpb.ColDef{{
+				Name: "a", ColId: 11, Seqnum: 5, Typ: planpb.Type{Id: int32(types.T_int64)},
+			}}},
+		}},
+	}
+	candidate, err := substrait.Export(query)
+	require.NoError(t, err)
+	protector := &siriusRuntimeTestProtector{}
+	leases := substrait.NewPersistentLeaseManager(1, protector, siriusDurableJournalStub{})
+	require.NoError(t, leases.Replay(context.Background()))
+	admitted, err := substrait.AdmitReads(context.Background(), substrait.AdmissionRequest{
+		Candidate: candidate, Provider: siriusRuntimeTestProvider{schema: candidate.Reads()[0].Schema},
+		Leases: leases, AccountID: 1, QueryID: bytes.Repeat([]byte{'e'}, 16),
+		SnapshotTS: make([]byte, 12), Consumer: substrait.ReadConsumerEmbeddedTAE,
+		TTL: time.Minute, ReadOnly: true,
+	})
+	require.NoError(t, err)
+	protector.failUnregister = true
+	var closes atomic.Int32
+	runtime := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedTAE,
+		Backend: &siriusEmbeddedBackendStub{close: func(context.Context) error {
+			closes.Add(1)
+			return nil
+		}},
+		Leases: leases, DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+	}
+	owner := &SiriusReadPlan{ReadRefs: admitted.ReadRefs, LeaseExpiresAt: admitted.ExpiresAt}
+	err = runtime.abortEmbeddedAdmittedRead(context.Background(), owner, errors.New("descriptor invariant"))
+	require.ErrorContains(t, err, "descriptor invariant")
+	require.ErrorContains(t, err, "test unregister failure")
+	require.Equal(t, int32(1), closes.Load(), "failed local release seals native admission")
+
+	protector.failUnregister = false
+	require.NoError(t, owner.Release(context.Background(), leases), "durable lease remains retryable")
+}
+
 func TestRecoverAdmittedReadReleasesOrRetainsRetryableOwner(t *testing.T) {
 	require.Error(t, (*SiriusRuntime)(nil).recoverAdmittedRead(context.Background(), 0, nil, nil))
 	query := &planpb.Query{
@@ -128,7 +284,7 @@ func TestRecoverAdmittedReadReleasesOrRetainsRetryableOwner(t *testing.T) {
 	admitted, err := substrait.AdmitReads(context.Background(), substrait.AdmissionRequest{
 		Candidate: candidate, Provider: siriusRuntimeTestProvider{schema: candidate.Reads()[0].Schema}, Leases: leases,
 		AccountID: 1, QueryID: bytes.Repeat([]byte{'q'}, 16), SnapshotTS: make([]byte, 12),
-		AuthorizedClientSPKIHash: make([]byte, 32), TTL: time.Minute, ReadOnly: true,
+		AuthorizedClientSPKIHash: bytes.Repeat([]byte{1}, 32), TTL: time.Minute, ReadOnly: true,
 	})
 	require.NoError(t, err)
 	require.Len(t, leases.PendingExecutions(), 1)
@@ -140,7 +296,7 @@ func TestRecoverAdmittedReadReleasesOrRetainsRetryableOwner(t *testing.T) {
 	admitted, err = substrait.AdmitReads(context.Background(), substrait.AdmissionRequest{
 		Candidate: candidate, Provider: siriusRuntimeTestProvider{schema: candidate.Reads()[0].Schema}, Leases: leases,
 		AccountID: 1, QueryID: bytes.Repeat([]byte{'r'}, 16), SnapshotTS: make([]byte, 12),
-		AuthorizedClientSPKIHash: make([]byte, 32), TTL: time.Minute, ReadOnly: true,
+		AuthorizedClientSPKIHash: bytes.Repeat([]byte{1}, 32), TTL: time.Minute, ReadOnly: true,
 	})
 	require.NoError(t, err)
 	protector.failUnregister = true
@@ -197,7 +353,7 @@ func TestEmbeddedSiriusAdmissionNeverSilentlyFallsBack(t *testing.T) {
 	runtime := moruntime.ServiceRuntime(proc.GetService())
 	previous, existed := runtime.GetGlobalVariables(SiriusRuntimeKey)
 	backend := &siriusAdmissionBackend{accepting: true}
-	configured := &SiriusRuntime{EmbeddedMO: true, Backend: backend, CleanupTimeout: time.Second}
+	configured := &SiriusRuntime{Source: SiriusRuntimeEmbeddedMO, Backend: backend, CleanupTimeout: time.Second}
 	runtime.SetGlobalVariables(SiriusRuntimeKey, configured)
 	t.Cleanup(func() {
 		if existed {

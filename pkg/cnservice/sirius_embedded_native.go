@@ -19,9 +19,11 @@ package cnservice
 import (
 	"context"
 	"errors"
+
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile/siriusbridge"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 )
 
 func (s *service) startEmbeddedSiriusRuntime(ctx context.Context) error {
@@ -32,11 +34,28 @@ func (s *service) startEmbeddedSiriusRuntime(ctx context.Context) error {
 	if err := validateSiriusEmbeddedConfig(c); err != nil {
 		return err
 	}
+	source := compile.SiriusRuntimeEmbeddedMO
+	if c.InputMode == "tae" {
+		source = compile.SiriusRuntimeEmbeddedTAE
+		if s.options.siriusLeases == nil || !s.options.siriusLeases.DurableReady() {
+			return siriusInternalErrorf("substrait: embedded TAE Sirius runtime requires replayed GC-protected lease dependencies")
+		}
+		if _, err := s.options.siriusLeases.ReconcileRestart(ctx, substrait.ReadConsumerEmbeddedTAE); err != nil {
+			return err
+		}
+	}
 	native, err := siriusbridge.New(siriusbridge.Config{ConfigPath: c.NativeConfigPath, GPUStreams: c.GPUStreams, MaxWaiting: c.MaxWaitingQueries, CleanupTimeout: c.CleanupTimeout.Duration})
 	if err != nil {
 		return err
 	}
-	runtime := &compile.SiriusRuntime{EmbeddedMO: true, Backend: &embeddedBackend{native: native}, CleanupTimeout: c.CleanupTimeout.Duration}
+	runtime := &compile.SiriusRuntime{
+		Source: source, Backend: &embeddedBackend{native: native}, CleanupTimeout: c.CleanupTimeout.Duration,
+	}
+	if source == compile.SiriusRuntimeEmbeddedTAE {
+		runtime.Leases = s.options.siriusLeases
+		runtime.DataDir = c.DataDir
+		runtime.LeaseTTL = c.LeaseTTL.Duration
+	}
 	if err = runtime.Validate(); err != nil {
 		return errors.Join(err, native.Close(ctx))
 	}
