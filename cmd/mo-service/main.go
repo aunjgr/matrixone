@@ -35,6 +35,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/clusterservice"
 	"github.com/matrixorigin/matrixone/pkg/cnservice"
 	"github.com/matrixorigin/matrixone/pkg/common/malloc"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
@@ -365,7 +366,16 @@ func startCNService(
 	fileService fileservice.FileService,
 	gossipNode *gossip.Node,
 ) error {
+	brokerHandedOff := false
+	defer func() {
+		if !brokerHandedOff && cfg.siriusLeaseBroker != nil {
+			cfg.siriusLeaseBroker.Seal()
+		}
+	}()
 	if err := cfg.verifySiriusBenchmarkNoGC(); err != nil {
+		return err
+	}
+	if err := cfg.verifySiriusCoLocatedTAE(); err != nil {
 		return err
 	}
 	c := cfg.getCNServiceConfig()
@@ -373,6 +383,10 @@ func startCNService(
 	system.Run(stopper)
 
 	if err := waitClusterCondition(cfg.mustGetServiceUUID(), cfg.HAKeeperClient, waitAnyShardReady); err != nil {
+		return err
+	}
+	siriusOptions, err := cfg.siriusCNServiceOptions()
+	if err != nil {
 		return err
 	}
 	finish := serviceLifecycle.registerTask(serviceRoleCN)
@@ -384,22 +398,37 @@ func startCNService(
 			finish(err)
 		})
 	}
-	err := stopper.RunNamedTask("cn-service", func(ctx context.Context) {
+	err = stopper.RunNamedTask("cn-service", func(ctx context.Context) {
 		var closeErr error
 		defer func() { finishTask(closeErr) }()
+		cnDrained := false
+		if cfg.siriusLeaseBroker != nil {
+			// Seal only after CN Close certifies that every local query owner and
+			// runtime dependency has drained. An incomplete close leaves both the
+			// broker and TN alive through the supervisor's fail-stop path.
+			defer func() {
+				if cnDrained {
+					cfg.siriusLeaseBroker.Seal()
+				}
+			}()
+		}
 		roleCtx, cancelRole := serviceLifecycle.roleContext(ctx, serviceRoleCN)
 		defer cancelRole()
 		cfg.initMetaCache()
 		commonConfigKVMap, _ := dumpCommonConfig(*cfg)
+		options := []cnservice.Option{
+			cnservice.WithLogger(logutil.GetGlobalLogger().Named("cn-service").With(zap.String("uuid", cfg.CN.UUID))),
+			cnservice.WithMessageHandle(compile.CnServerMessageHandler),
+			cnservice.WithConfigData(commonConfigKVMap),
+			cnservice.WithTxnTraceData(filepath.Join(cfg.DataDir, c.Txn.Trace.Dir)),
+		}
+		options = append(options, siriusOptions...)
 		s, err := cnservice.NewService(
 			&c,
 			ctx,
 			fileService,
 			gossipNode,
-			cnservice.WithLogger(logutil.GetGlobalLogger().Named("cn-service").With(zap.String("uuid", cfg.CN.UUID))),
-			cnservice.WithMessageHandle(compile.CnServerMessageHandler),
-			cnservice.WithConfigData(commonConfigKVMap),
-			cnservice.WithTxnTraceData(filepath.Join(cfg.DataDir, c.Txn.Trace.Dir)),
+			options...,
 		)
 		if err != nil {
 			panic(err)
@@ -415,19 +444,45 @@ func startCNService(
 				_ = fs.Cache.QueryClient.Close()
 			}
 		}
-		if err := s.Close(); err != nil {
-			closeErr = err
-			logutil.GetGlobalLogger().Error("failed to close cn service", zap.Error(err))
+		closeErr = s.Close()
+		cnDrained = cnServiceCloseComplete(s, closeErr)
+		if closeErr != nil {
+			logutil.GetGlobalLogger().Error("failed to close cn service", zap.Error(closeErr))
 		}
 	})
 	if err != nil {
 		finishTask(err)
+		return err
 	}
-	return err
+	brokerHandedOff = true
+	return nil
+}
+
+func cnServiceCloseComplete(owner any, err error) bool {
+	if owner, ok := owner.(interface{ CloseComplete() bool }); ok {
+		return owner.CloseComplete()
+	}
+	return err == nil
 }
 
 func (c *Config) verifySiriusBenchmarkNoGC() error {
 	return cnservice.VerifySiriusBenchmarkNoGC(&c.CN, c.benchmarkTNNoGC)
+}
+
+func (c *Config) verifySiriusCoLocatedTAE() error {
+	return cnservice.VerifySiriusCoLocatedTAE(&c.CN, c.siriusLeaseBroker != nil)
+}
+
+func (c *Config) siriusCNServiceOptions() ([]cnservice.Option, error) {
+	if c.siriusLeaseBroker == nil {
+		return nil, nil
+	}
+	leases, _, err := c.siriusLeaseBroker.Acquire()
+	if err != nil {
+		c.siriusLeaseBroker.Seal()
+		return nil, moerr.NewInvalidStateNoCtxf("acquire co-located Sirius TAE lease manager: %v", err)
+	}
+	return []cnservice.Option{cnservice.WithSiriusReadDependencies(leases, nil)}, nil
 }
 
 func startTNService(
@@ -458,12 +513,16 @@ func startTNService(
 		//notify the tn service it is in the standalone cluster
 		c.InStandalone = cfg.IsStandalone
 		commonConfigKVMap, _ := dumpCommonConfig(*cfg)
+		options := []tnservice.Option{tnservice.WithConfigData(commonConfigKVMap)}
+		if cfg.siriusLeaseBroker != nil {
+			options = append(options, tnservice.WithSiriusLeaseManagerBroker(cfg.siriusLeaseBroker))
+		}
 		s, err := tnservice.NewService(
 			&c,
 			mustGetRuntime(cfg),
 			fileService,
 			shutdownC,
-			tnservice.WithConfigData(commonConfigKVMap))
+			options...)
 		if err != nil {
 			panic(err)
 		}

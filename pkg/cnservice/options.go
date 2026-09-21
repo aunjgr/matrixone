@@ -68,14 +68,43 @@ func WithTxnTraceData(traceDataPath string) Option {
 }
 
 // WithSiriusReadDependencies supplies the storage-owned, GC-protected lease
-// authority and its durable resolve auditor. CN startup still constructs and
-// owns both mTLS endpoints. Keeping these dependencies explicit prevents an
-// unsafe process-local GC protector from being created as a fallback.
+// authority and, for Flight, its durable resolve auditor. Embedded/local
+// recovery does not resolve over the network and may pass a nil auditor. CN
+// startup still constructs and owns both Flight mTLS endpoints. Keeping these
+// dependencies explicit prevents an unsafe process-local GC protector from
+// being created as a fallback.
 func WithSiriusReadDependencies(leases *substrait.LeaseManager, auditor substrait.ResolveAuditRecorder) Option {
 	return func(s *service) {
 		s.options.siriusLeases = leases
 		s.options.siriusAuditor = auditor
 	}
+}
+
+// RequiresSiriusCoLocatedTAE reports whether cfg requests the direct embedded
+// TAE path. It deliberately examines only the explicit selector and does not
+// mutate defaults or treat a disabled Sirius section as an active capability.
+func RequiresSiriusCoLocatedTAE(cfg *Config) bool {
+	return cfg != nil && cfg.Sirius.Enabled &&
+		cfg.Sirius.Backend == "embedded" && cfg.Sirius.InputMode == "tae"
+}
+
+// VerifySiriusCoLocatedTAE records launcher-owned proof that direct TAE is
+// confined to one static process containing exactly one TAE TN shard and one
+// CN, and that the launcher installed the storage-owned lease-manager handoff.
+// The proof cannot be decoded from TOML.
+func VerifySiriusCoLocatedTAE(cfg *Config, verified bool) error {
+	if cfg == nil {
+		return nil
+	}
+	cfg.Sirius.coLocatedTAEVerified = false
+	if !RequiresSiriusCoLocatedTAE(cfg) {
+		return nil
+	}
+	if !verified {
+		return moerr.NewBadConfigNoCtx("embedded Sirius TAE input requires launcher-verified one-TN/one-shard/one-CN co-location")
+	}
+	cfg.Sirius.coLocatedTAEVerified = true
+	return nil
 }
 
 // VerifySiriusBenchmarkNoGC records the launcher-owned proof that the paired

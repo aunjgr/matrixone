@@ -15,6 +15,7 @@
 package cnservice
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -34,6 +35,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
@@ -44,15 +46,36 @@ import (
 
 type siriusTestProtector struct{}
 
-type siriusTestJournal struct{}
+type siriusTestJournal struct {
+	leases  []*substrait.Lease
+	marked  int
+	deleted int
+}
 
-func (siriusTestJournal) StoreIfCapacity(_ context.Context, leases []*substrait.Lease, _ int) (int, error) {
+func (*siriusTestJournal) StoreIfCapacity(_ context.Context, leases []*substrait.Lease, _ int) (int, error) {
 	return len(leases), nil
 }
-func (siriusTestJournal) Active(context.Context, *substrait.Lease) (bool, error) { return true, nil }
-func (siriusTestJournal) MarkReleased(context.Context, []byte) error             { return nil }
-func (siriusTestJournal) Delete(context.Context, []byte) error                   { return nil }
-func (siriusTestJournal) Load(context.Context, func(*substrait.Lease) error) error {
+func (*siriusTestJournal) Active(context.Context, *substrait.Lease) (bool, error) { return true, nil }
+func (j *siriusTestJournal) MarkReleased(context.Context, []byte) error {
+	j.marked++
+	return nil
+}
+func (j *siriusTestJournal) Delete(_ context.Context, readRef []byte) error {
+	j.deleted++
+	for i, lease := range j.leases {
+		if bytes.Equal(lease.Read.ReadRef, readRef) {
+			j.leases = append(j.leases[:i], j.leases[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+func (j *siriusTestJournal) Load(_ context.Context, visit func(*substrait.Lease) error) error {
+	for _, lease := range j.leases {
+		if err := visit(lease); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -86,6 +109,49 @@ func (siriusTestProtector) Begin(context.Context) (
 }
 
 func (siriusTestProtector) Unregister(context.Context, []byte) error { return nil }
+
+func newSiriusRecoveryManager(
+	t *testing.T,
+	consumers ...substrait.ReadConsumer,
+) (*substrait.LeaseManager, *siriusTestJournal) {
+	t.Helper()
+	journal := new(siriusTestJournal)
+	for i, consumer := range consumers {
+		seed := byte(i + 1)
+		manifest := []byte{'m', seed}
+		schema := []byte{'s', seed}
+		manifestHash := sha256.Sum256(manifest)
+		schemaHash := sha256.Sum256(schema)
+		read := &substrait.TaeRead{
+			ProtocolVersion: substrait.TaeReadProtocolVersion,
+			ReadRef:         bytes.Repeat([]byte{seed}, sha256.Size),
+			QueryID:         []byte{'q', seed},
+			AccountID:       1,
+			DatabaseID:      2,
+			TableID:         uint64(seed),
+			SnapshotTS:      make([]byte, types.TxnTsSize),
+			SchemaDigest:    schemaHash[:],
+			ManifestSHA256:  manifestHash[:],
+			CapabilityHash:  substrait.CapabilityHash[:],
+			ExpiresAtUnixMS: uint64(time.Now().Add(time.Hour).UnixMilli()),
+		}
+		wire, err := substrait.MarshalTaeRead(read)
+		require.NoError(t, err)
+		marker := bytes.Repeat([]byte{seed}, sha256.Size)
+		if consumer == substrait.ReadConsumerEmbeddedTAE {
+			marker = make([]byte, sha256.Size)
+		}
+		journal.leases = append(journal.leases, &substrait.Lease{
+			Read: read, Wire: wire, Manifest: manifest, CanonicalSchema: schema,
+			AuthorizedClientSPKIHash: marker, Consumer: consumer,
+		})
+	}
+	manager := substrait.NewPersistentLeaseManager(
+		len(consumers)+1, siriusTestProtector{}, journal,
+	)
+	require.NoError(t, manager.Replay(context.Background()))
+	return manager, journal
+}
 
 func TestSiriusInternalErrorfUsesMoerrAndPreservesCause(t *testing.T) {
 	plain := siriusInternalErrorf("configuration failure")
@@ -131,6 +197,73 @@ func TestSiriusConfigIsOptInAndFailClosed(t *testing.T) {
 	enabled.CleanupTimeout.Duration = time.Duration(1 << 62)
 	enabled.LeaseTTL.Duration = substrait.MaxLeaseTTL
 	require.ErrorContains(t, enabled.validate(), "invalid Sirius transport limits")
+}
+
+func TestSiriusCoLocatedTAEProofIsNotConfigurable(t *testing.T) {
+	require.NoError(t, VerifySiriusCoLocatedTAE(nil, false))
+	cfg := &Config{Sirius: SiriusConfig{
+		Enabled: true, Backend: "embedded", InputMode: "tae",
+	}}
+	require.True(t, RequiresSiriusCoLocatedTAE(cfg))
+	require.ErrorContains(t, VerifySiriusCoLocatedTAE(cfg, false), "launcher-verified")
+	require.False(t, cfg.Sirius.coLocatedTAEVerified)
+	require.NoError(t, VerifySiriusCoLocatedTAE(cfg, true))
+	require.True(t, cfg.Sirius.coLocatedTAEVerified)
+
+	cfg.Sirius.Enabled = false
+	require.False(t, RequiresSiriusCoLocatedTAE(cfg))
+	require.NoError(t, VerifySiriusCoLocatedTAE(cfg, false))
+	require.False(t, cfg.Sirius.coLocatedTAEVerified)
+}
+
+func TestSiriusStartupReconcilesDurableEmbeddedReadsWithoutRuntime(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config SiriusConfig
+		starts bool
+	}{
+		{name: "disabled", config: SiriusConfig{}, starts: true},
+		{name: "embedded-mo", config: SiriusConfig{Enabled: true, Backend: "embedded", InputMode: "mo"}},
+		{name: "embedded-tae", config: SiriusConfig{Enabled: true, Backend: "embedded", InputMode: "tae", coLocatedTAEVerified: true}},
+		{name: "benchmark", config: SiriusConfig{Enabled: true, BenchmarkNoGC: true, benchmarkGCDisabled: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager, journal := newSiriusRecoveryManager(t, substrait.ReadConsumerEmbeddedTAE)
+			s := &service{cfg: &Config{Sirius: tc.config}}
+			WithSiriusReadDependencies(manager, nil)(s)
+			err := s.startSiriusRuntime(context.Background())
+			if tc.starts {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			require.Equal(t, 1, journal.marked)
+			require.Equal(t, 1, journal.deleted)
+			require.Empty(t, manager.PendingExecutions())
+		})
+	}
+}
+
+func TestSiriusLocalStartupRejectsUnreconciledFlightReads(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config SiriusConfig
+	}{
+		{name: "disabled", config: SiriusConfig{}},
+		{name: "embedded-mo", config: SiriusConfig{Enabled: true, Backend: "embedded", InputMode: "mo"}},
+		{name: "embedded-tae", config: SiriusConfig{Enabled: true, Backend: "embedded", InputMode: "tae", coLocatedTAEVerified: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager, journal := newSiriusRecoveryManager(t, substrait.ReadConsumerFlight)
+			s := &service{cfg: &Config{Sirius: tc.config}}
+			WithSiriusReadDependencies(manager, nil)(s)
+			err := s.startSiriusRuntime(context.Background())
+			require.ErrorContains(t, err, "unreconciled Flight")
+			require.Zero(t, journal.marked)
+			require.Zero(t, journal.deleted)
+			require.Len(t, manager.PendingExecutions(), 1)
+		})
+	}
 }
 
 func TestSiriusBackendSelectionFailsBeforeTransportSetup(t *testing.T) {
@@ -270,7 +403,7 @@ func TestSiriusTLSLoadersAndStartupCleanup(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, spkiHash, actualHash)
 
-	leases := substrait.NewPersistentLeaseManager(1, siriusTestProtector{}, siriusTestJournal{})
+	leases := substrait.NewPersistentLeaseManager(1, siriusTestProtector{}, new(siriusTestJournal))
 	require.NoError(t, leases.Replay(context.Background()))
 	auditor := substrait.ResolveAuditFunc(func(context.Context, substrait.ResolveAuditEvent) error { return nil })
 	s := &service{cfg: &Config{UUID: "sirius-startup-test", Sirius: config}}
@@ -335,6 +468,9 @@ func TestSiriusTLSLoadersRejectInvalidFilesAndDependencies(t *testing.T) {
 	require.ErrorContains(t, err, "load resolver client certificate")
 
 	s := &service{cfg: &Config{Sirius: SiriusConfig{Enabled: true}}}
+	require.ErrorContains(t, s.startSiriusRuntime(context.Background()), "GC-protected lease dependencies")
+	manager, _ := newSiriusRecoveryManager(t)
+	WithSiriusReadDependencies(manager, nil)(s)
 	require.ErrorContains(t, s.startSiriusRuntime(context.Background()), "GC-protected lease dependencies")
 	s.cfg.Sirius.Enabled = false
 	require.NoError(t, s.startSiriusRuntime(context.Background()))

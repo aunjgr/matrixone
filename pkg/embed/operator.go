@@ -39,6 +39,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/queryservice/client"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 	"github.com/matrixorigin/matrixone/pkg/tnservice"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
 	"github.com/matrixorigin/matrixone/pkg/util/status"
@@ -47,12 +48,14 @@ import (
 type operator struct {
 	sync.RWMutex
 
-	sid         string
-	cfg         ServiceConfig
-	index       int
-	serviceType metadata.ServiceType
-	state       state
-	testing     bool
+	sid                string
+	cfg                ServiceConfig
+	index              int
+	serviceType        metadata.ServiceType
+	state              state
+	testing            bool
+	siriusLeaseBroker  *substrait.LeaseManagerBroker
+	siriusCoLocatedTAE bool
 
 	reset struct {
 		svc        service
@@ -137,6 +140,9 @@ func (op *operator) Close() error {
 		op.reset.svc == nil &&
 		op.reset.stopper == nil &&
 		op.reset.fs == nil {
+		if op.serviceType == metadata.ServiceType_CN && op.siriusLeaseBroker != nil {
+			op.siriusLeaseBroker.Seal()
+		}
 		return nil
 	}
 
@@ -151,6 +157,11 @@ func (op *operator) Close() error {
 			return errors.Join(err, moerr.NewInvalidStateNoCtx("service cleanup is incomplete"))
 		}
 		op.reset.svc = nil
+	}
+	if op.serviceType == metadata.ServiceType_CN && op.siriusLeaseBroker != nil {
+		// The concrete CN has completed its drain. Seal before the reverse-order
+		// cluster shutdown proceeds to the TN storage owner.
+		op.siriusLeaseBroker.Seal()
 	}
 	if op.reset.stopper != nil {
 		op.reset.stopper.Stop()
@@ -219,6 +230,17 @@ func (op *operator) Start() error {
 	if op.serviceType == metadata.ServiceType_CN {
 		if err := op.verifySiriusBenchmarkNoGC(); err != nil {
 			return err
+		}
+		if err := cnservice.VerifySiriusCoLocatedTAE(&op.cfg.CN, op.siriusCoLocatedTAE); err != nil {
+			return err
+		}
+		if op.siriusCoLocatedTAE {
+			if op.siriusLeaseBroker == nil {
+				return moerr.NewInvalidStateNoCtx("embedded Sirius TAE input has no co-located lease-manager broker")
+			}
+			if _, _, err := op.siriusLeaseBroker.Acquire(); err != nil {
+				return moerr.NewInvalidStateNoCtxf("embedded Sirius TAE CN replacement is unavailable: %v", err)
+			}
 		}
 	}
 
@@ -316,6 +338,7 @@ func (op *operator) startTNServiceLocked(
 		fs,
 		op.reset.shutdownC,
 		tnservice.WithConfigData(commonConfigKVMap),
+		tnservice.WithSiriusLeaseManagerBroker(op.siriusLeaseBroker),
 	)
 	if err != nil {
 		return err
@@ -338,15 +361,26 @@ func (op *operator) startCNServiceLocked(
 	}
 	op.cfg.initMetaCache()
 	commonConfigKVMap, _ := dumpCommonConfig(op.cfg)
+	options := []cnservice.Option{
+		cnservice.WithLogger(op.reset.logger),
+		cnservice.WithMessageHandle(compile.CnServerMessageHandler),
+		cnservice.WithConfigData(commonConfigKVMap),
+		cnservice.WithTxnTraceData(filepath.Join(op.cfg.DataDir, c.Txn.Trace.Dir)),
+	}
+	if op.siriusLeaseBroker != nil {
+		leases, _, err := op.siriusLeaseBroker.Acquire()
+		if err != nil {
+			op.siriusLeaseBroker.Seal()
+			return moerr.NewInvalidStateNoCtxf("acquire co-located Sirius TAE lease manager: %v", err)
+		}
+		options = append(options, cnservice.WithSiriusReadDependencies(leases, nil))
+	}
 	s, err := cnservice.NewService(
 		&c,
 		context.Background(),
 		fs,
 		op.reset.gossipNode,
-		cnservice.WithLogger(op.reset.logger),
-		cnservice.WithMessageHandle(compile.CnServerMessageHandler),
-		cnservice.WithConfigData(commonConfigKVMap),
-		cnservice.WithTxnTraceData(filepath.Join(op.cfg.DataDir, c.Txn.Trace.Dir)),
+		options...,
 	)
 	if err != nil {
 		return err

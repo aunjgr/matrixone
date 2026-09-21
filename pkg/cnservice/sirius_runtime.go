@@ -52,6 +52,21 @@ func siriusInternalErrorf(format string, args ...any) error {
 
 func (s *service) startSiriusRuntime(ctx context.Context) error {
 	config := s.cfg.Sirius
+	// The storage owner replays leases before publishing its manager. Reconcile
+	// stale in-process work before every local/no-runtime startup mode as well,
+	// so disabling Sirius or switching to MO readers cannot strand old direct
+	// TAE protection. Enabled Flight keeps its external quiescence path below.
+	if !config.Enabled || config.Backend == "embedded" || config.BenchmarkNoGC {
+		if s.options.siriusLeases != nil {
+			if s.options.siriusLeases.DurableReady() {
+				if _, err := s.options.siriusLeases.ReconcileRestart(ctx, substrait.ReadConsumerEmbeddedTAE); err != nil {
+					return err
+				}
+			} else if !config.BenchmarkNoGC || !s.options.siriusLeases.BenchmarkReady() {
+				return siriusInternalErrorf("substrait: injected Sirius recovery lease manager is not durable and replayed")
+			}
+		}
+	}
 	if !config.Enabled {
 		return nil
 	}
@@ -65,7 +80,10 @@ func (s *service) startSiriusRuntime(ctx context.Context) error {
 		if !config.benchmarkGCDisabled {
 			return siriusInternalErrorf("substrait: Sirius benchmark-no-gc requires verified TN GC disablement")
 		}
-		if s.options.siriusLeases == nil && s.options.siriusAuditor == nil {
+		// A durable manager supplied by the co-located launcher was used only for
+		// restart cleanup above. Benchmark execution remains visibly separate and
+		// cannot present durable protection as proof that TN GC is disabled.
+		if s.options.siriusLeases == nil || s.options.siriusLeases.DurableReady() {
 			s.options.siriusLeases, s.options.siriusAuditor = newSiriusBenchmarkDependencies()
 		}
 		if s.options.siriusLeases == nil || !s.options.siriusLeases.BenchmarkReady() || s.options.siriusAuditor == nil {

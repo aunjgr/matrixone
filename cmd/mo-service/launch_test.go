@@ -31,12 +31,46 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/matrixorigin/matrixone/pkg/cnservice"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
 	logpb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 )
+
+type launchSiriusProtector struct{}
+
+func (launchSiriusProtector) Begin(context.Context) (
+	func(context.Context, []byte, []string, time.Time) error,
+	func(context.Context, []byte) error,
+	func(),
+	error,
+) {
+	return func(context.Context, []byte, []string, time.Time) error { return nil },
+		func(context.Context, []byte) error { return nil }, func() {}, nil
+}
+
+func (launchSiriusProtector) Unregister(context.Context, []byte) error { return nil }
+
+type launchSiriusJournal struct{}
+
+type launchCloseCertificate bool
+
+func (c launchCloseCertificate) CloseComplete() bool { return bool(c) }
+
+func (launchSiriusJournal) StoreIfCapacity(_ context.Context, leases []*substrait.Lease, _ int) (int, error) {
+	return len(leases), nil
+}
+func (launchSiriusJournal) Active(context.Context, *substrait.Lease) (bool, error) {
+	return true, nil
+}
+func (launchSiriusJournal) MarkReleased(context.Context, []byte) error { return nil }
+func (launchSiriusJournal) Delete(context.Context, []byte) error       { return nil }
+func (launchSiriusJournal) Load(context.Context, func(*substrait.Lease) error) error {
+	return nil
+}
 
 type testProxy struct {
 	address   string
@@ -835,6 +869,98 @@ func TestStartCNServiceRejectsUnverifiedSiriusBenchmarkBeforeStartup(t *testing.
 	cfg.CN.Sirius.BenchmarkNoGC = true
 	require.ErrorContains(t, startService(context.Background(), cfg, nil, nil), "disable-gc=true")
 	require.ErrorContains(t, startCNService(cfg, nil, nil, nil), "disable-gc=true")
+}
+
+func TestStaticSiriusTAELaunchTopology(t *testing.T) {
+	logConfig := writeLaunchTestFile(t, "log.toml", "service-type=\"LOG\"\n")
+	tnConfig := writeLaunchTestFile(t, "tn.toml", "service-type=\"TN\"\n[tn.Txn.Storage]\nbackend=\"TAE\"\n")
+	directCN := writeLaunchTestFile(t, "cn.toml", `service-type="CN"
+[cn.sirius]
+enabled=true
+backend="embedded"
+input-mode="tae"
+`)
+	plan, err := prepareStaticSiriusLaunch(&LaunchConfig{
+		LogServiceConfigFiles: []string{logConfig}, TNServiceConfigsFiles: []string{tnConfig}, CNServiceConfigsFiles: []string{directCN},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan.broker)
+	require.Len(t, plan.tn, 1)
+	require.Len(t, plan.cn, 1)
+	plan.tn[0].siriusLeaseBroker = plan.broker
+	plan.cn[0].siriusLeaseBroker = plan.broker
+	require.NoError(t, plan.cn[0].verifySiriusCoLocatedTAE())
+
+	secondCN := writeLaunchTestFile(t, "cn-2.toml", "service-type=\"CN\"\n")
+	_, err = prepareStaticSiriusLaunch(&LaunchConfig{
+		LogServiceConfigFiles: []string{logConfig}, TNServiceConfigsFiles: []string{tnConfig}, CNServiceConfigsFiles: []string{directCN, secondCN},
+	})
+	require.ErrorContains(t, err, "one-TAE-TN/one-shard/one-CN")
+
+	twoShardLog := writeLaunchTestFile(t, "log-two-shards.toml", `service-type="LOG"
+[logservice.BootstrapConfig]
+bootstrap-cluster=true
+num-of-log-shards=2
+num-of-tn-shards=2
+`)
+	_, err = prepareStaticSiriusLaunch(&LaunchConfig{
+		LogServiceConfigFiles: []string{twoShardLog}, TNServiceConfigsFiles: []string{tnConfig}, CNServiceConfigsFiles: []string{directCN},
+	})
+	require.ErrorContains(t, err, "one-TAE-TN/one-shard/one-CN")
+
+	memTN := writeLaunchTestFile(t, "mem-tn.toml", "service-type=\"TN\"\n[tn.Txn.Storage]\nbackend=\"MEMKV\"\n")
+	_, err = prepareStaticSiriusLaunch(&LaunchConfig{
+		LogServiceConfigFiles: []string{logConfig}, TNServiceConfigsFiles: []string{memTN}, CNServiceConfigsFiles: []string{directCN},
+	})
+	require.ErrorContains(t, err, "one-TAE-TN/one-shard/one-CN")
+}
+
+func TestDynamicSiriusTAELaunchRejectedBeforeStartup(t *testing.T) {
+	template := writeLaunchTestFile(t, "dynamic-cn.toml", `service-type="CN"
+[cn.sirius]
+enabled=true
+backend="embedded"
+input-mode="tae"
+# %d %d %d %d %d %d
+`)
+	require.ErrorContains(t, rejectDynamicSiriusTAE(Dynamic{ServiceCount: 1, CNTemplate: template}), "dynamic CN")
+	require.NoError(t, rejectDynamicSiriusTAE(Dynamic{ServiceCount: 0, CNTemplate: template}))
+}
+
+func TestSiriusLeaseBrokerAcquisitionIsRequiredBeforeCNConstruction(t *testing.T) {
+	separate := NewConfig()
+	separate.CN.Sirius = cnservice.SiriusConfig{
+		Enabled: true, Backend: "embedded", InputMode: "tae",
+	}
+	require.ErrorContains(t, separate.verifySiriusCoLocatedTAE(), "launcher-verified")
+
+	broker := substrait.NewLeaseManagerBroker()
+	cfg := NewConfig()
+	cfg.siriusLeaseBroker = broker
+	_, err := cfg.siriusCNServiceOptions()
+	require.ErrorContains(t, err, "not published")
+	_, _, err = broker.Acquire()
+	require.ErrorContains(t, err, "sealed")
+
+	broker = substrait.NewLeaseManagerBroker()
+	manager := substrait.NewPersistentLeaseManager(1, launchSiriusProtector{}, launchSiriusJournal{})
+	require.NoError(t, manager.Replay(t.Context()))
+	publication, err := broker.Prepare("tae-tn-shard/1", manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	cfg.siriusLeaseBroker = broker
+	options, err := cfg.siriusCNServiceOptions()
+	require.NoError(t, err)
+	require.Len(t, options, 1)
+}
+
+func TestCNServiceCloseCompletionControlsBrokerSeal(t *testing.T) {
+	failure := errors.New("drain incomplete")
+	require.False(t, cnServiceCloseComplete(launchCloseCertificate(false), nil))
+	require.False(t, cnServiceCloseComplete(launchCloseCertificate(false), failure))
+	require.True(t, cnServiceCloseComplete(launchCloseCertificate(true), failure))
+	require.True(t, cnServiceCloseComplete(struct{}{}, nil))
+	require.False(t, cnServiceCloseComplete(struct{}{}, failure))
 }
 
 func TestCNProxyStartErrorAndSingleCN(t *testing.T) {

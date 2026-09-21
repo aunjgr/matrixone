@@ -28,9 +28,12 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/google/uuid"
+	"github.com/matrixorigin/matrixone/pkg/cnservice"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 	"github.com/matrixorigin/matrixone/pkg/testutil/clusteradmission"
+	"github.com/matrixorigin/matrixone/pkg/tnservice"
 	"github.com/matrixorigin/matrixone/pkg/util/fault"
 )
 
@@ -78,11 +81,13 @@ type cluster struct {
 	services []*operator
 	startFn  func(*operator) error
 
-	pendingCleanup []*operator
-	portLease      *clusterPortLease
-	portLeaseBase  uint64
-	portLeaseNext  uint64
-	testAdmission  *clusteradmission.Lease
+	pendingCleanup    []*operator
+	siriusLeaseBroker *substrait.LeaseManagerBroker
+	siriusDirectTAE   bool
+	portLease         *clusterPortLease
+	portLeaseBase     uint64
+	portLeaseNext     uint64
+	testAdmission     *clusteradmission.Lease
 
 	options struct {
 		dataPath                    string
@@ -160,6 +165,9 @@ func (c *cluster) Start() (err error) {
 	}
 	if c.needsCleanupLocked() || c.testAdmission != nil {
 		return moerr.NewInvalidStateNoCtx("embedded cluster cleanup is incomplete")
+	}
+	if err = c.configureSiriusCoLocationLocked(); err != nil {
+		return err
 	}
 	phaseStarted := time.Now()
 	if err = c.ensurePortLeaseLocked(); err != nil {
@@ -386,6 +394,9 @@ func (c *cluster) StartNewCNService(n int) error {
 	if c.state != started {
 		panic("cannot start cn services in stopped cluster")
 	}
+	if n > 0 && c.siriusDirectTAE {
+		return moerr.NewNotSupportedNoCtx("embedded Sirius TAE input does not support dynamic or replacement CNs")
+	}
 	if err := c.retryPendingCleanupLocked(); err != nil {
 		return err
 	}
@@ -406,6 +417,59 @@ func (c *cluster) StartNewCNService(n int) error {
 
 	if err := c.doStartLocked(serviceFrom); err != nil {
 		return errors.Join(err, c.rollbackNewServicesLocked(serviceFrom, cnFrom))
+	}
+	return nil
+}
+
+func (c *cluster) configureSiriusCoLocationLocked() error {
+	var logOps, tnOps, cnOps []*operator
+	directTAE := false
+	for _, op := range c.services {
+		op.siriusLeaseBroker = nil
+		op.siriusCoLocatedTAE = false
+		switch op.serviceType {
+		case metadata.ServiceType_LOG:
+			logOps = append(logOps, op)
+		case metadata.ServiceType_TN:
+			tnOps = append(tnOps, op)
+		case metadata.ServiceType_CN:
+			cnOps = append(cnOps, op)
+			directTAE = directTAE || cnservice.RequiresSiriusCoLocatedTAE(&op.cfg.CN)
+		}
+	}
+	taeTN := false
+	if len(tnOps) == 1 {
+		backend := tnOps[0].cfg.getTNServiceConfig().Txn.Storage.Backend
+		taeTN = backend == "" || backend == tnservice.StorageTAE
+	}
+	oneShard := false
+	for _, op := range logOps {
+		bootstrap := op.cfg.LogService.BootstrapConfig
+		if bootstrap.BootstrapCluster {
+			if bootstrap.NumOfTNShards != 1 {
+				oneShard = false
+				break
+			}
+			oneShard = true
+		}
+	}
+	safe := len(tnOps) == 1 && len(cnOps) == 1 && taeTN && oneShard
+	if directTAE && !safe {
+		return moerr.NewBadConfigNoCtx("embedded Sirius TAE input requires one TAE TN shard and one static CN")
+	}
+	c.siriusLeaseBroker = nil
+	c.siriusDirectTAE = directTAE
+	if safe {
+		c.siriusLeaseBroker = substrait.NewLeaseManagerBroker()
+		tnOps[0].cfg.IsStandalone = true
+		tnOps[0].siriusLeaseBroker = c.siriusLeaseBroker
+		cnOps[0].siriusLeaseBroker = c.siriusLeaseBroker
+		cnOps[0].siriusCoLocatedTAE = directTAE
+	}
+	for _, op := range cnOps {
+		if err := cnservice.VerifySiriusCoLocatedTAE(&op.cfg.CN, op.siriusCoLocatedTAE); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -31,6 +31,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 	"github.com/matrixorigin/matrixone/pkg/testutil/clusteradmission"
 	"github.com/matrixorigin/matrixone/pkg/tnservice"
 	"github.com/matrixorigin/matrixone/pkg/txn/rpc"
@@ -43,6 +44,46 @@ type closeTrackingService struct {
 	closeCount atomic.Int32
 	startErr   error
 	closeErr   error
+}
+
+type closeFuncService struct {
+	close func() error
+}
+
+func (*closeFuncService) Start() error { return nil }
+func (s *closeFuncService) Close() error {
+	if s.close == nil {
+		return nil
+	}
+	return s.close()
+}
+
+type embedSiriusProtector struct{}
+
+func (embedSiriusProtector) Begin(context.Context) (
+	func(context.Context, []byte, []string, time.Time) error,
+	func(context.Context, []byte) error,
+	func(),
+	error,
+) {
+	return func(context.Context, []byte, []string, time.Time) error { return nil },
+		func(context.Context, []byte) error { return nil }, func() {}, nil
+}
+
+func (embedSiriusProtector) Unregister(context.Context, []byte) error { return nil }
+
+type embedSiriusJournal struct{}
+
+func (embedSiriusJournal) StoreIfCapacity(_ context.Context, leases []*substrait.Lease, _ int) (int, error) {
+	return len(leases), nil
+}
+func (embedSiriusJournal) Active(context.Context, *substrait.Lease) (bool, error) {
+	return true, nil
+}
+func (embedSiriusJournal) MarkReleased(context.Context, []byte) error { return nil }
+func (embedSiriusJournal) Delete(context.Context, []byte) error       { return nil }
+func (embedSiriusJournal) Load(context.Context, func(*substrait.Lease) error) error {
+	return nil
 }
 
 func (s *closeTrackingService) Start() error {
@@ -176,6 +217,116 @@ func TestOperatorRejectsUnverifiedSiriusBenchmarkBeforeStartup(t *testing.T) {
 	op.cfg.TN_please_use_getTNServiceConfig.GCCfg.DisableGC = true
 	require.ErrorContains(t, op.Start(), "launcher-verified")
 	require.False(t, op.needsCleanup())
+}
+
+func TestEmbeddedSiriusTAETopologyAndBrokerShutdownOrder(t *testing.T) {
+	logOp := &operator{serviceType: metadata.ServiceType_LOG}
+	logOp.cfg.LogService.BootstrapConfig.BootstrapCluster = true
+	logOp.cfg.LogService.BootstrapConfig.NumOfTNShards = 1
+	tnOp := &operator{serviceType: metadata.ServiceType_TN}
+	tnOp.cfg.TN_please_use_getTNServiceConfig = &tnservice.Config{}
+	tnOp.cfg.TN_please_use_getTNServiceConfig.Txn.Storage.Backend = tnservice.StorageTAE
+	cnOp := &operator{serviceType: metadata.ServiceType_CN}
+	cnOp.cfg.ServiceType = metadata.ServiceType_CN.String()
+	cnOp.cfg.CN.Sirius = cnservice.SiriusConfig{
+		Enabled: true, Backend: "embedded", InputMode: "tae",
+	}
+	c := &cluster{services: []*operator{logOp, tnOp, cnOp}}
+	require.NoError(t, c.configureSiriusCoLocationLocked())
+	require.NotNil(t, c.siriusLeaseBroker)
+	require.True(t, c.siriusDirectTAE)
+	require.Same(t, c.siriusLeaseBroker, tnOp.siriusLeaseBroker)
+	require.Same(t, c.siriusLeaseBroker, cnOp.siriusLeaseBroker)
+	require.True(t, cnOp.siriusCoLocatedTAE)
+
+	manager := substrait.NewPersistentLeaseManager(1, embedSiriusProtector{}, embedSiriusJournal{})
+	require.NoError(t, manager.Replay(t.Context()))
+	publication, err := c.siriusLeaseBroker.Prepare("tae-tn-shard/1", manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	cnOp.state = started
+	cnOp.reset.svc = &closeFuncService{close: func() error {
+		_, _, acquireErr := c.siriusLeaseBroker.Acquire()
+		return acquireErr
+	}}
+	require.NoError(t, cnOp.Close(), "broker must remain available while CN drains")
+	_, _, err = c.siriusLeaseBroker.Acquire()
+	require.ErrorContains(t, err, "sealed")
+	require.ErrorContains(t, cnOp.Start(), "replacement is unavailable")
+	require.False(t, cnOp.needsCleanup(), "replacement refusal must precede resource construction")
+
+	c.state = started
+	require.ErrorContains(t, c.StartNewCNService(1), "does not support dynamic")
+}
+
+func TestEmbeddedSiriusTAEStartsTNPublicationBeforeCN(t *testing.T) {
+	logOp := &operator{serviceType: metadata.ServiceType_LOG}
+	logOp.cfg.LogService.BootstrapConfig.BootstrapCluster = true
+	logOp.cfg.LogService.BootstrapConfig.NumOfTNShards = 1
+	tnOp := &operator{serviceType: metadata.ServiceType_TN}
+	tnOp.cfg.TN_please_use_getTNServiceConfig = &tnservice.Config{}
+	tnOp.cfg.TN_please_use_getTNServiceConfig.Txn.Storage.Backend = tnservice.StorageTAE
+	cnOp := &operator{serviceType: metadata.ServiceType_CN}
+	cnOp.cfg.CN.Sirius = cnservice.SiriusConfig{Enabled: true, Backend: "embedded", InputMode: "tae"}
+	c := &cluster{services: []*operator{logOp, tnOp, cnOp}}
+	require.NoError(t, c.configureSiriusCoLocationLocked())
+
+	manager := substrait.NewPersistentLeaseManager(1, embedSiriusProtector{}, embedSiriusJournal{})
+	require.NoError(t, manager.Replay(t.Context()))
+	var order []metadata.ServiceType
+	c.startFn = func(op *operator) error {
+		order = append(order, op.serviceType)
+		switch op.serviceType {
+		case metadata.ServiceType_TN:
+			publication, err := c.siriusLeaseBroker.Prepare("tae-tn-shard/1", manager)
+			if err != nil {
+				return err
+			}
+			return publication.Publish()
+		case metadata.ServiceType_CN:
+			_, _, err := c.siriusLeaseBroker.Acquire()
+			return err
+		default:
+			return nil
+		}
+	}
+	require.NoError(t, c.doStartLocked(0))
+	require.Equal(t, []metadata.ServiceType{
+		metadata.ServiceType_LOG, metadata.ServiceType_TN, metadata.ServiceType_CN,
+	}, order)
+}
+
+func TestEmbeddedSiriusTAERejectsUnsafeTopology(t *testing.T) {
+	base := func() (*operator, *operator, *operator) {
+		logOp := &operator{serviceType: metadata.ServiceType_LOG}
+		logOp.cfg.LogService.BootstrapConfig.BootstrapCluster = true
+		logOp.cfg.LogService.BootstrapConfig.NumOfTNShards = 1
+		tnOp := &operator{serviceType: metadata.ServiceType_TN}
+		tnOp.cfg.TN_please_use_getTNServiceConfig = &tnservice.Config{}
+		tnOp.cfg.TN_please_use_getTNServiceConfig.Txn.Storage.Backend = tnservice.StorageTAE
+		cnOp := &operator{serviceType: metadata.ServiceType_CN}
+		cnOp.cfg.CN.Sirius = cnservice.SiriusConfig{Enabled: true, Backend: "embedded", InputMode: "tae"}
+		return logOp, tnOp, cnOp
+	}
+
+	t.Run("multiple CNs", func(t *testing.T) {
+		logOp, tnOp, cnOp := base()
+		extra := &operator{serviceType: metadata.ServiceType_CN}
+		err := (&cluster{services: []*operator{logOp, tnOp, cnOp, extra}}).configureSiriusCoLocationLocked()
+		require.ErrorContains(t, err, "one TAE TN shard and one static CN")
+	})
+	t.Run("multiple shards", func(t *testing.T) {
+		logOp, tnOp, cnOp := base()
+		logOp.cfg.LogService.BootstrapConfig.NumOfTNShards = 2
+		err := (&cluster{services: []*operator{logOp, tnOp, cnOp}}).configureSiriusCoLocationLocked()
+		require.ErrorContains(t, err, "one TAE TN shard and one static CN")
+	})
+	t.Run("non TAE TN", func(t *testing.T) {
+		logOp, tnOp, cnOp := base()
+		tnOp.cfg.TN_please_use_getTNServiceConfig.Txn.Storage.Backend = tnservice.StorageMEMKV
+		err := (&cluster{services: []*operator{logOp, tnOp, cnOp}}).configureSiriusCoLocationLocked()
+		require.ErrorContains(t, err, "one TAE TN shard and one static CN")
+	})
 }
 
 func TestWithHAKeeperHeartbeatTimeout(t *testing.T) {

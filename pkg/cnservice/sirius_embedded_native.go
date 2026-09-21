@@ -19,11 +19,11 @@ package cnservice
 import (
 	"context"
 	"errors"
+	"time"
 
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile/siriusbridge"
-	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 )
 
 func (s *service) startEmbeddedSiriusRuntime(ctx context.Context) error {
@@ -37,11 +37,11 @@ func (s *service) startEmbeddedSiriusRuntime(ctx context.Context) error {
 	source := compile.SiriusRuntimeEmbeddedMO
 	if c.InputMode == "tae" {
 		source = compile.SiriusRuntimeEmbeddedTAE
+		if !c.coLocatedTAEVerified {
+			return siriusInternalErrorf("substrait: embedded TAE Sirius runtime requires launcher-verified co-location")
+		}
 		if s.options.siriusLeases == nil || !s.options.siriusLeases.DurableReady() {
 			return siriusInternalErrorf("substrait: embedded TAE Sirius runtime requires replayed GC-protected lease dependencies")
-		}
-		if _, err := s.options.siriusLeases.ReconcileRestart(ctx, substrait.ReadConsumerEmbeddedTAE); err != nil {
-			return err
 		}
 	}
 	native, err := siriusbridge.New(siriusbridge.Config{ConfigPath: c.NativeConfigPath, GPUStreams: c.GPUStreams, MaxWaiting: c.MaxWaitingQueries, CleanupTimeout: c.CleanupTimeout.Duration})
@@ -51,15 +51,27 @@ func (s *service) startEmbeddedSiriusRuntime(ctx context.Context) error {
 	runtime := &compile.SiriusRuntime{
 		Source: source, Backend: &embeddedBackend{native: native}, CleanupTimeout: c.CleanupTimeout.Duration,
 	}
+	if err = runtime.InitEmbeddedAdmission(c.MaxWaitingQueries); err != nil {
+		return errors.Join(err, closeUnpublishedEmbeddedSirius(native, c.CleanupTimeout.Duration))
+	}
 	if source == compile.SiriusRuntimeEmbeddedTAE {
 		runtime.Leases = s.options.siriusLeases
 		runtime.DataDir = c.DataDir
 		runtime.LeaseTTL = c.LeaseTTL.Duration
 	}
 	if err = runtime.Validate(); err != nil {
-		return errors.Join(err, native.Close(ctx))
+		return errors.Join(err, closeUnpublishedEmbeddedSirius(native, c.CleanupTimeout.Duration))
 	}
 	s.siriusRuntime = runtime
 	moruntime.ServiceRuntime(s.cfg.UUID).SetGlobalVariables(compile.SiriusRuntimeKey, runtime)
 	return nil
+}
+
+func closeUnpublishedEmbeddedSirius(native *siriusbridge.Runtime, timeout time.Duration) error {
+	if native == nil {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return native.Close(cleanupCtx)
 }

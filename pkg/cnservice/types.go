@@ -119,7 +119,12 @@ type SiriusConfig struct {
 	BenchmarkNoGC bool `toml:"benchmark-no-gc"`
 	// benchmarkGCDisabled is set by the top-level launcher after it verifies
 	// the paired TN configuration. It is intentionally not user-configurable.
-	benchmarkGCDisabled    bool
+	benchmarkGCDisabled bool
+	// coLocatedTAEVerified is set only by the static one-TN/one-shard/one-CN
+	// launcher after it has installed the storage-owned lease manager handoff.
+	// It is intentionally not user-configurable: input-mode=tae in TOML alone
+	// must never authorize direct access to process-local TAE state.
+	coLocatedTAEVerified   bool
 	FlightAddress          string        `toml:"flight-address"`
 	FlightServerName       string        `toml:"flight-server-name"`
 	FlightClientCertPath   string        `toml:"flight-client-cert-path"`

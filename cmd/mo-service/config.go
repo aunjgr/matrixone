@@ -44,6 +44,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 	"github.com/matrixorigin/matrixone/pkg/proxy"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 	"github.com/matrixorigin/matrixone/pkg/tnservice"
 	"github.com/matrixorigin/matrixone/pkg/udf/pythonservice"
 	"github.com/matrixorigin/matrixone/pkg/util/debug/goroutine"
@@ -102,6 +103,10 @@ type Config struct {
 	// config when a launch manifest starts CN and TN from separate files. It is
 	// never decoded from TOML and is consumed only by CN startup validation.
 	benchmarkTNNoGC bool
+	// siriusLeaseBroker is injected only by the verified static launcher. The
+	// field is not TOML-visible, so a standalone CN config cannot assert access
+	// to a process-local TAE manager.
+	siriusLeaseBroker *substrait.LeaseManagerBroker
 
 	// DataDir data dir
 	DataDir string `toml:"data-dir"`
