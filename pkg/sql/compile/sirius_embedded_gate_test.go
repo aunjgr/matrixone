@@ -26,6 +26,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -336,7 +337,7 @@ func TestSiriusEmbeddedRunReleasesOrSealsAdmission(t *testing.T) {
 				cleanupTimeout = 10 * time.Millisecond
 			}
 			siriusRuntime := &SiriusRuntime{
-				Source: SiriusRuntimeEmbeddedTAE, CleanupTimeout: cleanupTimeout,
+				Source: SiriusRuntimeEmbeddedMO, CleanupTimeout: cleanupTimeout,
 			}
 			require.NoError(t, siriusRuntime.InitEmbeddedAdmission(1))
 			permit, err := siriusRuntime.acquireEmbeddedAdmission(context.Background())
@@ -401,7 +402,7 @@ func TestSiriusEmbeddedRunReleasesOrSealsAdmission(t *testing.T) {
 
 func TestSiriusReadOwnerConcurrentCleanupWaitHonorsContext(t *testing.T) {
 	siriusRuntime := &SiriusRuntime{
-		Source: SiriusRuntimeEmbeddedTAE, CleanupTimeout: time.Second,
+		Source: SiriusRuntimeEmbeddedMO, CleanupTimeout: time.Second,
 	}
 	require.NoError(t, siriusRuntime.InitEmbeddedAdmission(1))
 	permit, err := siriusRuntime.acquireEmbeddedAdmission(context.Background())
@@ -448,7 +449,7 @@ func (c *siriusObservedDoneContext) Done() <-chan struct{} {
 
 func TestSiriusReadOwnerFailureSealsBeforeConcurrentRetry(t *testing.T) {
 	siriusRuntime := &SiriusRuntime{
-		Source: SiriusRuntimeEmbeddedTAE, CleanupTimeout: time.Second,
+		Source: SiriusRuntimeEmbeddedMO, CleanupTimeout: time.Second,
 	}
 	require.NoError(t, siriusRuntime.InitEmbeddedAdmission(1))
 	permit, err := siriusRuntime.acquireEmbeddedAdmission(context.Background())
@@ -521,6 +522,10 @@ func TestSiriusEmbeddedMOAndTAEShareAdmissionGate(t *testing.T) {
 	taeRuntime := &SiriusRuntime{
 		Source: SiriusRuntimeEmbeddedTAE, embeddedAdmission: moRuntime.embeddedAdmission,
 	}
+	taeRuntime.Leases = substrait.NewPersistentLeaseManager(
+		1, &siriusRuntimeTestProtector{}, siriusDurableJournalStub{})
+	require.NoError(t, taeRuntime.Leases.Replay(t.Context()))
+	taeRuntime.LeaseCapability = siriusRuntimeTestCapabilityFor(t, taeRuntime.Leases)
 	moPermit, err := moRuntime.acquireEmbeddedAdmission(context.Background())
 	require.NoError(t, err)
 	type result struct {
@@ -547,4 +552,38 @@ func TestSiriusEmbeddedAdmissionConfiguration(t *testing.T) {
 	require.Equal(t, int(defaultSiriusEmbeddedMaxWaiting), siriusRuntime.embeddedAdmission.maxWaiting)
 	require.ErrorContains(t, siriusRuntime.InitEmbeddedAdmission(1), "already initialized")
 	require.Error(t, (&SiriusRuntime{Source: SiriusRuntimeEmbeddedMO}).InitEmbeddedAdmission(17))
+}
+
+func TestSiriusStorageRevocationSealsQueuedAdmissionButPreservesActiveOwner(t *testing.T) {
+	manager := substrait.NewPersistentLeaseManager(
+		1, &siriusRuntimeTestProtector{}, siriusDurableJournalStub{})
+	require.NoError(t, manager.Replay(t.Context()))
+	broker, capability := siriusRuntimeTestBrokerCapabilityFor(t, manager)
+	runtime := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedMO, Backend: new(siriusReconcileBackend),
+		CleanupTimeout: time.Second, LeaseCapability: capability,
+	}
+	require.NoError(t, runtime.InitEmbeddedAdmission(1))
+	active, err := runtime.acquireEmbeddedAdmission(t.Context())
+	require.NoError(t, err)
+	waiter := make(chan error, 1)
+	go func() {
+		permit, acquireErr := runtime.acquireEmbeddedAdmission(context.Background())
+		if permit != nil {
+			permit.release()
+		}
+		waiter <- acquireErr
+	}()
+	waitForSiriusGateWaiters(t, runtime.embeddedAdmission, 1)
+
+	refuse, err := broker.RevokeStorage(capability.StorageIdentity())
+	require.NoError(t, err)
+	require.True(t, refuse)
+	require.ErrorContains(t, runtime.Validate(), "capability is revoked")
+	require.ErrorContains(t, receiveSiriusGateResult(t, waiter), "admission is sealed")
+	runtime.embeddedAdmission.mu.Lock()
+	require.True(t, runtime.embeddedAdmission.active,
+		"revocation must not steal the active query's cleanup ownership")
+	runtime.embeddedAdmission.mu.Unlock()
+	active.release()
 }

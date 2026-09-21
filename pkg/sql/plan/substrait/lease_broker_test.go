@@ -18,6 +18,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -122,4 +123,83 @@ func TestLeaseManagerBrokerSealNeverReleasesProtection(t *testing.T) {
 	_, _, err = broker.Acquire()
 	require.ErrorContains(t, err, "sealed")
 	require.True(t, manager.DurableReady(), "seal must not mutate or release the manager")
+}
+
+func TestLeaseManagerCapabilityRevokesBeforeStorageTeardown(t *testing.T) {
+	broker := NewLeaseManagerBroker()
+	manager := replayedBrokerTestManager(t)
+	publication, err := broker.Prepare("tae-tn-shard/1/replica/2", manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	capability, err := broker.AttestTopology("tae-tn-shard/1/replica/2", time.Minute)
+	require.NoError(t, err)
+	identity := capability.StorageIdentity()
+	require.Equal(t, identity, capability.StorageIdentity())
+	require.NoError(t, capability.Healthy())
+
+	refuse, err := broker.RevokeStorage("tae-tn-shard/9/replica/9")
+	require.NoError(t, err)
+	require.False(t, refuse)
+	require.NoError(t, capability.Healthy())
+
+	refuse, err = broker.RevokeStorage(identity)
+	require.NoError(t, err)
+	require.True(t, refuse)
+	require.ErrorContains(t, capability.Healthy(), "revoked")
+	_, _, _, err = broker.AcquireCapability()
+	require.ErrorContains(t, err, "sealed")
+	refuse, err = broker.RevokeStorage(identity)
+	require.NoError(t, err)
+	require.True(t, refuse, "repeat removal remains refused before CN drain")
+
+	broker.Seal()
+	refuse, err = broker.RevokeStorage(identity)
+	require.NoError(t, err)
+	require.False(t, refuse, "CN drain authorizes orderly storage teardown")
+	require.True(t, manager.DurableReady(), "revocation never removes active protection")
+}
+
+func TestLeaseManagerCapabilityExpiresWithoutSourceRemove(t *testing.T) {
+	now := time.Unix(100, 0)
+	broker := NewLeaseManagerBroker()
+	broker.now = func() time.Time { return now }
+	manager := replayedBrokerTestManager(t)
+	identity := "tae-tn-shard/3/replica/4"
+	publication, err := broker.Prepare(identity, manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	capability, err := broker.AttestTopology(identity, 10*time.Second)
+	require.NoError(t, err)
+	require.NoError(t, capability.Healthy())
+	now = now.Add(11 * time.Second)
+	require.ErrorContains(t, capability.Healthy(), "revoked")
+	require.ErrorContains(t, capability.RenewTopology(time.Minute), "revoked")
+	_, err = broker.AttestTopology(identity, time.Minute)
+	require.ErrorContains(t, err, "already attested")
+	require.True(t, manager.DurableReady(), "attestation expiry must retain the old protection owner")
+}
+
+func TestTopologyRenewalHandoffCoversSlowConstructionWithFakeClock(t *testing.T) {
+	now := time.Unix(200, 0)
+	broker := NewLeaseManagerBroker()
+	broker.now = func() time.Time { return now }
+	manager := replayedBrokerTestManager(t)
+	identity := "tae-tn-shard/5/replica/6"
+	publication, err := broker.Prepare(identity, manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	capability, err := broker.AttestTopology(identity, 30*time.Second)
+	require.NoError(t, err)
+	handoff := &LeaseManagerCapabilityHandoff{
+		capability: capability, validFor: 30 * time.Second,
+	}
+	for range 32 {
+		now = now.Add(29 * time.Second)
+		require.NoError(t, handoff.renew())
+		require.NoError(t, capability.Healthy())
+	}
+	require.Greater(t, now.Sub(time.Unix(200, 0)), 15*time.Minute,
+		"construction/replay bridge must not inherit request timeout")
+	now = now.Add(31 * time.Second)
+	require.ErrorContains(t, capability.Healthy(), "revoked")
 }

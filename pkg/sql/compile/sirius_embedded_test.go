@@ -673,7 +673,8 @@ func TestEmbeddedTAEAdmissionPreparesNativeWithoutMOProducer(t *testing.T) {
 			}}
 			runtime := &SiriusRuntime{
 				Source: SiriusRuntimeEmbeddedTAE, Backend: backend, Leases: leases,
-				DataDir: "/shared/tae", LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+				LeaseCapability: siriusRuntimeTestCapabilityFor(t, leases),
+				DataDir:         "/shared/tae", LeaseTTL: time.Minute, CleanupTimeout: time.Second,
 			}
 			require.NoError(t, runtime.InitEmbeddedAdmission(16))
 			serviceRuntime := moruntime.ServiceRuntime(proc.GetService())

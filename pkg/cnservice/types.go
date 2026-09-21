@@ -882,10 +882,13 @@ type service struct {
 	config     *util.ConfigData
 
 	options struct {
-		bootstrapOptions []bootstrap.Option
-		traceDataPath    string
-		siriusLeases     *substrait.LeaseManager
-		siriusAuditor    substrait.ResolveAuditRecorder
+		bootstrapOptions        []bootstrap.Option
+		traceDataPath           string
+		siriusLeases            *substrait.LeaseManager
+		siriusAuditor           substrait.ResolveAuditRecorder
+		siriusCapability        *substrait.LeaseManagerCapability
+		siriusTopologyValidator SiriusTopologyValidator
+		siriusTopologyHandoff   *substrait.LeaseManagerCapabilityHandoff
 	}
 
 	// pipelines record running pipelines in the service, used for monitoring.

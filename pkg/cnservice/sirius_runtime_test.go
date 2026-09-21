@@ -36,15 +36,24 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
+	"github.com/matrixorigin/matrixone/pkg/util/toml"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
 type siriusTestProtector struct{}
+
+type siriusTopologyHAKeeperStub struct{ logservice.CNHAKeeperClient }
+
+type siriusTopologyBackendStub struct{ compile.SiriusBackend }
+
+func (siriusTopologyBackendStub) Close(context.Context) error { return nil }
 
 type siriusTestJournal struct {
 	leases  []*substrait.Lease
@@ -125,7 +134,7 @@ func newSiriusRecoveryManager(
 		read := &substrait.TaeRead{
 			ProtocolVersion: substrait.TaeReadProtocolVersion,
 			ReadRef:         bytes.Repeat([]byte{seed}, sha256.Size),
-			QueryID:         []byte{'q', seed},
+			QueryID:         bytes.Repeat([]byte{seed}, 16),
 			AccountID:       1,
 			DatabaseID:      2,
 			TableID:         uint64(seed),
@@ -264,6 +273,61 @@ func TestSiriusLocalStartupRejectsUnreconciledFlightReads(t *testing.T) {
 			require.Len(t, manager.PendingExecutions(), 1)
 		})
 	}
+}
+
+func TestSiriusStartupRejectsRevokedLocalStorageBeforeDisabledRecovery(t *testing.T) {
+	for _, config := range []SiriusConfig{
+		{},
+		{Enabled: true, Backend: "embedded", InputMode: "mo"},
+	} {
+		manager, _ := newSiriusRecoveryManager(t)
+		broker := substrait.NewLeaseManagerBroker()
+		publication, err := broker.Prepare("tae-tn-shard/1/replica/2", manager)
+		require.NoError(t, err)
+		require.NoError(t, publication.Publish())
+		capability, err := broker.AttestTopology("tae-tn-shard/1/replica/2", time.Minute)
+		require.NoError(t, err)
+		s := &service{cfg: &Config{Sirius: config}}
+		WithSiriusReadDependencies(manager, nil)(s)
+		WithSiriusLeaseManagerCapability(capability)(s)
+		refuse, err := broker.RevokeStorage(capability.StorageIdentity())
+		require.NoError(t, err)
+		require.True(t, refuse)
+		require.ErrorContains(t, s.startSiriusRuntime(t.Context()), "capability is revoked")
+		require.Nil(t, s.siriusRuntime)
+	}
+}
+
+func TestSiriusTopologyMonitorRevokesPostAttestationGeneration(t *testing.T) {
+	manager, _ := newSiriusRecoveryManager(t)
+	broker := substrait.NewLeaseManagerBroker()
+	identity := "tae-tn-shard/1/replica/2"
+	publication, err := broker.Prepare(identity, manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	capability, err := broker.AttestTopology(identity, DefaultSiriusTopologyValidity)
+	require.NoError(t, err)
+	runtime := &compile.SiriusRuntime{
+		Source:  compile.SiriusRuntimeEmbeddedMO,
+		Backend: siriusTopologyBackendStub{}, CleanupTimeout: time.Second,
+		LeaseCapability: capability,
+	}
+	require.NoError(t, runtime.InitEmbeddedAdmission(1))
+	valid := true
+	s := &service{siriusRuntime: runtime, _hakeeperClient: siriusTopologyHAKeeperStub{}}
+	s.options.siriusCapability = capability
+	s.options.siriusTopologyValidator = func(context.Context, logservice.CNHAKeeperClient) error {
+		if !valid {
+			return errors.New("second live TN observed")
+		}
+		return nil
+	}
+	require.NoError(t, s.checkSiriusTopology(t.Context()))
+	require.NoError(t, capability.Healthy())
+	valid = false
+	require.ErrorContains(t, s.checkSiriusTopology(t.Context()), "second live TN")
+	require.ErrorContains(t, capability.Healthy(), "revoked")
+	require.False(t, runtime.Validate() == nil)
 }
 
 func TestSiriusBackendSelectionFailsBeforeTransportSetup(t *testing.T) {
@@ -476,6 +540,50 @@ func TestSiriusTLSLoadersRejectInvalidFilesAndDependencies(t *testing.T) {
 	require.NoError(t, s.startSiriusRuntime(context.Background()))
 }
 
+func TestSiriusFlightStartupUsesDurableAuditAndReconcilesPendingReplay(t *testing.T) {
+	certPath, keyPath, _ := writeSiriusTestCertificate(t)
+	address := startSiriusTestFlightServer(t, certPath, keyPath)
+	for _, backend := range []string{"", "flight"} {
+		t.Run(map[bool]string{true: "default", false: "explicit"}[backend == ""], func(t *testing.T) {
+			manager, _ := newSiriusRecoveryManager(t, substrait.ReadConsumerFlight)
+			broker := substrait.NewLeaseManagerBroker()
+			publication, err := broker.Prepare("tae-tn-shard/1/replica/2", manager)
+			require.NoError(t, err)
+			require.NoError(t, publication.Publish())
+			capability, err := broker.AttestTopology("tae-tn-shard/1/replica/2", time.Minute)
+			require.NoError(t, err)
+			auditFS, err := fileservice.NewMemoryFS("sirius-audit", fileservice.CacheConfig{}, nil)
+			require.NoError(t, err)
+			auditor, err := substrait.NewFileServiceResolveAuditRecorder(auditFS, "cn-flight")
+			require.NoError(t, err)
+
+			serviceID := "sirius-flight-audit-" + map[bool]string{true: "default", false: "explicit"}[backend == ""]
+			moruntime.SetupServiceBasedRuntime(serviceID, moruntime.NewRuntime(metadata.ServiceType_CN, serviceID, nil))
+			config := SiriusConfig{
+				Enabled: backend == "" || backend == "flight", Backend: backend,
+				FlightAddress: address, FlightServerName: "localhost",
+				FlightClientCertPath: certPath, FlightClientKeyPath: keyPath,
+				FlightServerCAPath: certPath, ResolverAddress: "127.0.0.1:0",
+				ResolverServerCertPath: certPath, ResolverServerKeyPath: keyPath,
+				ResolverClientCAPath: certPath, ResolverClientCertPath: certPath,
+				DataDir: t.TempDir(), MaxBatchBytes: 1 << 20,
+				RequestTimeout: toml.Duration{Duration: 5 * time.Second},
+				CleanupTimeout: toml.Duration{Duration: time.Second},
+				LeaseTTL:       toml.Duration{Duration: time.Minute},
+			}
+			s := &service{cfg: &Config{UUID: serviceID, Sirius: config}}
+			WithSiriusReadDependencies(manager, auditor)(s)
+			WithSiriusLeaseManagerCapability(capability)(s)
+			require.NoError(t, s.startSiriusRuntime(t.Context()))
+			require.NotNil(t, s.siriusRuntime)
+			require.Same(t, capability, s.siriusRuntime.LeaseCapability)
+			require.Len(t, manager.PendingExecutions(), 1)
+			require.NoError(t, s.closeSiriusRuntime())
+			require.Empty(t, manager.PendingExecutions())
+		})
+	}
+}
+
 func writeSiriusTestCertificate(t *testing.T) (string, string, []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -520,10 +628,14 @@ func startSiriusTestFlightServer(t *testing.T, certPath, keyPath string) string 
 				if err := stream.RecvMsg(action); err != nil {
 					return err
 				}
-				if action.Type != "GetCapabilities" {
+				switch action.Type {
+				case "GetCapabilities":
+					return stream.SendMsg(&siriusTestFlightResult{Body: []byte(substrait.CapabilityDocument)})
+				case "CancelExecution":
+					return stream.SendMsg(&siriusTestFlightResult{Body: []byte("quiesced")})
+				default:
 					return moerr.NewInternalErrorNoCtx("unexpected Flight action")
 				}
-				return stream.SendMsg(&siriusTestFlightResult{Body: []byte(substrait.CapabilityDocument)})
 			},
 		}},
 	}, new(struct{}))

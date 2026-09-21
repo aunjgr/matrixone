@@ -19,10 +19,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	logservicepb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 	gc "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/gc/v3"
@@ -37,9 +39,11 @@ func testSiriusLeaseBootstrapContext(
 	t.Helper()
 	fs, err := fileservice.NewMemoryFS("tn-sirius-lease", fileservice.CacheConfig{}, nil)
 	require.NoError(t, err)
+	generation := sha256.Sum256([]byte(SiriusTAELeaseStorageIdentity(shard)))
 	return options.PreGCBootstrapContext{
-		SharedFileService: fs,
-		Shard:             shard,
+		SharedFileService:       fs,
+		Shard:                   shard,
+		StorageGenerationSHA256: generation[:],
 		Protector: gc.SidecarReadProtector{
 			Manager: gc.NewSyncProtectionManager(),
 		},
@@ -109,6 +113,118 @@ func TestSiriusTAELeaseBootstrapRejectsReplacementGeneration(t *testing.T) {
 	require.ErrorContains(t, err, "sealed")
 }
 
+func TestExplicitBrokerReplicaRemovalRevokesAndRefusesReplacement(t *testing.T) {
+	shard := metadata.TNShard{
+		TNShardRecord: metadata.TNShardRecord{ShardID: 32, LogShardID: 33},
+		ReplicaID:     34,
+	}
+	broker := substrait.NewLeaseManagerBroker()
+	bootstrap, err := newSiriusTAELeaseBootstrap(broker, shard, 1)
+	require.NoError(t, err)
+	require.NoError(t, bootstrap.bootstrap(
+		context.Background(), testSiriusLeaseBootstrapContext(t, shard)))
+	require.NoError(t, bootstrap.finish(nil))
+	capability, err := broker.AttestTopology(SiriusTAELeaseStorageIdentity(shard), time.Minute)
+	require.NoError(t, err)
+
+	store := &store{replicas: new(sync.Map)}
+	store.options.siriusLeaseBroker = broker
+	replica := &replica{shard: shard}
+	store.replicas.Store(shard.ShardID, replica)
+	err = store.removeReplicaLocked(shard.ShardID)
+	require.ErrorContains(t, err, "may still be in use")
+	require.Same(t, replica, store.getReplica(shard.ShardID), "protected storage must remain owned")
+	require.ErrorContains(t, capability.Healthy(), "revoked")
+
+	readded := shard
+	readded.ReplicaID++
+	replacement, err := newSiriusTAELeaseBootstrap(broker, readded, 1)
+	require.NoError(t, err)
+	require.ErrorContains(t,
+		replacement.bootstrap(context.Background(), testSiriusLeaseBootstrapContext(t, readded)),
+		"broker is sealed",
+	)
+	require.Same(t, replica, store.getReplica(shard.ShardID))
+}
+
+func TestDurableStorageAuthorityRejectsExternalTNAndRelocationBeforeSourceRemove(t *testing.T) {
+	fs, err := fileservice.NewMemoryFS("tn-sirius-authority", fileservice.CacheConfig{}, nil)
+	require.NoError(t, err)
+	shard := metadata.TNShard{
+		TNShardRecord: metadata.TNShardRecord{ShardID: 35, LogShardID: 36},
+		ReplicaID:     37,
+	}
+	bootstrapContext := func(value metadata.TNShard) options.PreGCBootstrapContext {
+		generation := sha256.Sum256([]byte("source-generation"))
+		return options.PreGCBootstrapContext{
+			SharedFileService: fs, Shard: value,
+			StorageGenerationSHA256: generation[:],
+			Protector:               gc.SidecarReadProtector{Manager: gc.NewSyncProtectionManager()},
+		}
+	}
+	sourceBroker := substrait.NewLeaseManagerBroker()
+	source, err := newSiriusTAELeaseBootstrapForStore(
+		sourceBroker, shard, 1, "tn-source", true)
+	require.NoError(t, err)
+	require.NoError(t, source.bootstrap(t.Context(), bootstrapContext(shard)))
+	require.NoError(t, source.finish(nil))
+	sourceCapability, err := sourceBroker.AttestTopology(
+		SiriusTAELeaseStorageIdentity(shard), time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, sourceCapability.Healthy())
+	overlapContext := bootstrapContext(shard)
+	overlapGeneration := sha256.Sum256([]byte("overlapping-copied-directory"))
+	overlapContext.StorageGenerationSHA256 = overlapGeneration[:]
+	overlap, err := newSiriusTAELeaseBootstrapForStore(
+		nil, shard, 1, "tn-source", false)
+	require.NoError(t, err)
+	require.ErrorContains(t, overlap.bootstrap(t.Context(), overlapContext),
+		"different Sirius storage authority")
+
+	external, err := newSiriusTAELeaseBootstrapForStore(
+		nil, shard, 1, "tn-external", false)
+	require.NoError(t, err)
+	require.ErrorContains(t,
+		external.bootstrap(t.Context(), bootstrapContext(shard)),
+		"different Sirius storage authority",
+	)
+
+	relocatedShard := shard
+	relocatedShard.ReplicaID++
+	relocated, err := newSiriusTAELeaseBootstrapForStore(
+		nil, relocatedShard, 1, "tn-source", false)
+	require.NoError(t, err)
+	require.ErrorContains(t,
+		relocated.bootstrap(t.Context(), bootstrapContext(relocatedShard)),
+		"different Sirius storage authority",
+	)
+	require.NoError(t, sourceCapability.Healthy(),
+		"failed destination open must not disturb the in-flight source owner")
+
+	sourceCapability.RevokeTopology()
+	sourceBroker.Seal()
+	restartBroker := substrait.NewLeaseManagerBroker()
+	restart, err := newSiriusTAELeaseBootstrapForStore(
+		restartBroker, shard, 1, "tn-source", true)
+	require.NoError(t, err)
+	require.NoError(t, restart.bootstrap(t.Context(), bootstrapContext(shard)))
+	require.NoError(t, restart.finish(nil), "the exact owner generation may replay after restart")
+}
+
+func TestDistributedTAEWithoutStorageAuthorityKeepsLegacyOpen(t *testing.T) {
+	shard := metadata.TNShard{
+		TNShardRecord: metadata.TNShardRecord{ShardID: 38, LogShardID: 39},
+		ReplicaID:     40,
+	}
+	bootstrap, err := newSiriusTAELeaseBootstrapForStore(
+		nil, shard, 1, "tn-distributed", false)
+	require.NoError(t, err)
+	require.NoError(t, bootstrap.bootstrap(
+		t.Context(), testSiriusLeaseBootstrapContext(t, shard)))
+	require.True(t, bootstrap.skipped)
+	require.NoError(t, bootstrap.finish(nil))
+}
+
 func TestSiriusTAELeaseBootstrapValidatesShardAndCapacity(t *testing.T) {
 	shard := metadata.TNShard{TNShardRecord: metadata.TNShardRecord{ShardID: 41}}
 	broker := substrait.NewLeaseManagerBroker()
@@ -141,8 +257,34 @@ func TestSiriusReadLeaseCapacityDefaultAndBounds(t *testing.T) {
 	require.ErrorContains(t, cfg.Validate(), "sirius read lease capacity")
 }
 
+func TestValidateSiriusTAELiveTopologyUsesStoreAndReplicaGeneration(t *testing.T) {
+	identity := SiriusTAELeaseStorageIdentity(metadata.TNShard{
+		TNShardRecord: metadata.TNShardRecord{ShardID: 7}, ReplicaID: 8,
+	})
+	valid := logservicepb.ClusterDetails{TNStores: []logservicepb.TNStore{
+		{UUID: "tn-live", State: logservicepb.NormalState, Shards: []logservicepb.TNShardInfo{{ShardID: 7, ReplicaID: 8}}},
+		{UUID: "tn-expired", State: logservicepb.TimeoutState, Shards: []logservicepb.TNShardInfo{{ShardID: 99, ReplicaID: 99}}},
+	}}
+	require.NoError(t, ValidateSiriusTAELiveTopology(valid, "tn-live", identity))
+
+	wrongUUID := valid
+	wrongUUID.TNStores = append([]logservicepb.TNStore(nil), valid.TNStores...)
+	wrongUUID.TNStores[0].UUID = "tn-stale"
+	require.ErrorContains(t, ValidateSiriusTAELiveTopology(wrongUUID, "tn-live", identity), "live topology")
+
+	wrongReplica := valid
+	wrongReplica.TNStores = append([]logservicepb.TNStore(nil), valid.TNStores...)
+	wrongReplica.TNStores[0].Shards = []logservicepb.TNShardInfo{{ShardID: 7, ReplicaID: 9}}
+	require.ErrorContains(t, ValidateSiriusTAELiveTopology(wrongReplica, "tn-live", identity), "published Sirius storage generation")
+
+	multiple := valid
+	multiple.TNStores = append(append([]logservicepb.TNStore(nil), valid.TNStores...),
+		logservicepb.TNStore{UUID: "tn-other", State: logservicepb.NormalState, Shards: []logservicepb.TNShardInfo{{ShardID: 7, ReplicaID: 8}}})
+	require.ErrorContains(t, ValidateSiriusTAELiveTopology(multiple, "tn-live", identity), "live topology")
+}
+
 func TestSiriusTAELeaseBootstrapNilBrokerKeepsShardsIndependent(t *testing.T) {
-	legacy := &store{cfg: &Config{InStandalone: true}}
+	legacy := &store{cfg: &Config{UUID: "tn-legacy", InStandalone: true}}
 	legacy.cfg.Txn.Storage.SiriusReadLeaseCapacity = DefaultSiriusReadLeaseCapacity
 	WithSiriusLeaseManagerBroker(nil)(legacy)
 	for _, shardID := range []uint64{1, 2} {
@@ -158,7 +300,7 @@ func TestSiriusTAELeaseBootstrapNilBrokerKeepsShardsIndependent(t *testing.T) {
 	}
 
 	broker := substrait.NewLeaseManagerBroker()
-	verified := &store{cfg: &Config{InStandalone: true}}
+	verified := &store{cfg: &Config{UUID: "tn-verified", InStandalone: true}}
 	verified.cfg.Txn.Storage.SiriusReadLeaseCapacity = DefaultSiriusReadLeaseCapacity
 	WithSiriusLeaseManagerBroker(broker)(verified)
 	bootstrap, err := verified.newSiriusTAELeaseBootstrap(metadata.TNShard{
@@ -167,13 +309,13 @@ func TestSiriusTAELeaseBootstrapNilBrokerKeepsShardsIndependent(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, bootstrap)
 
-	distributed := &store{cfg: &Config{}}
+	distributed := &store{cfg: &Config{UUID: "tn-distributed"}}
 	distributed.cfg.Txn.Storage.SiriusReadLeaseCapacity = DefaultSiriusReadLeaseCapacity
 	WithSiriusLeaseManagerBroker(broker)(distributed)
 	bootstrap, err = distributed.newSiriusTAELeaseBootstrap(metadata.TNShard{
 		TNShardRecord: metadata.TNShardRecord{ShardID: 1},
 	})
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "co-located standalone TN")
 	require.Nil(t, bootstrap)
 }
 
@@ -247,10 +389,12 @@ func TestSiriusTAELeaseBootstrapWithoutBrokerReleasesStaleEmbeddedLease(t *testi
 	manager := gc.NewSyncProtectionManager()
 	bootstrap, err := newSiriusTAELeaseBootstrap(nil, shard, DefaultSiriusReadLeaseCapacity)
 	require.NoError(t, err)
+	generation := sha256.Sum256([]byte("stale-embedded-generation"))
 	require.NoError(t, bootstrap.bootstrap(context.Background(), options.PreGCBootstrapContext{
-		SharedFileService: fs,
-		Shard:             shard,
-		Protector:         gc.SidecarReadProtector{Manager: manager},
+		SharedFileService:       fs,
+		Shard:                   shard,
+		StorageGenerationSHA256: generation[:],
+		Protector:               gc.SidecarReadProtector{Manager: manager},
 	}))
 	require.NoError(t, bootstrap.finish(nil))
 	require.Zero(t, countSiriusLeaseRecords(t, fs, shard))
@@ -265,10 +409,12 @@ func TestSiriusTAELeaseBootstrapWithoutBrokerRejectsStaleFlightLease(t *testing.
 	manager := gc.NewSyncProtectionManager()
 	bootstrap, err := newSiriusTAELeaseBootstrap(nil, shard, DefaultSiriusReadLeaseCapacity)
 	require.NoError(t, err)
+	generation := sha256.Sum256([]byte("stale-flight-generation"))
 	err = bootstrap.bootstrap(context.Background(), options.PreGCBootstrapContext{
-		SharedFileService: fs,
-		Shard:             shard,
-		Protector:         gc.SidecarReadProtector{Manager: manager},
+		SharedFileService:       fs,
+		Shard:                   shard,
+		StorageGenerationSHA256: generation[:],
+		Protector:               gc.SidecarReadProtector{Manager: manager},
 	})
 	require.ErrorContains(t, err, "unreconciled Flight reads")
 	require.Equal(t, 1, countSiriusLeaseRecords(t, fs, shard))

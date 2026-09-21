@@ -34,10 +34,13 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/cnservice"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
+	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
 	logpb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
+	"github.com/matrixorigin/matrixone/pkg/tnservice"
 )
 
 type launchSiriusProtector struct{}
@@ -937,21 +940,63 @@ func TestSiriusLeaseBrokerAcquisitionIsRequiredBeforeCNConstruction(t *testing.T
 	broker := substrait.NewLeaseManagerBroker()
 	cfg := NewConfig()
 	cfg.siriusLeaseBroker = broker
-	_, err := cfg.siriusCNServiceOptions()
+	client := &testHAKeeperClient{getDetails: func(context.Context) (logpb.ClusterDetails, error) {
+		return logpb.ClusterDetails{}, nil
+	}}
+	_, err := cfg.acquireSiriusCNReadDependencies(client)
 	require.ErrorContains(t, err, "not published")
+	broker.Seal()
 	_, _, err = broker.Acquire()
 	require.ErrorContains(t, err, "sealed")
 
 	broker = substrait.NewLeaseManagerBroker()
 	manager := substrait.NewPersistentLeaseManager(1, launchSiriusProtector{}, launchSiriusJournal{})
 	require.NoError(t, manager.Replay(t.Context()))
-	publication, err := broker.Prepare("tae-tn-shard/1", manager)
+	shard := metadata.TNShard{TNShardRecord: metadata.TNShardRecord{ShardID: 1}, ReplicaID: 2}
+	publication, err := broker.Prepare(tnservice.SiriusTAELeaseStorageIdentity(shard), manager)
 	require.NoError(t, err)
 	require.NoError(t, publication.Publish())
 	cfg.siriusLeaseBroker = broker
-	options, err := cfg.siriusCNServiceOptions()
+	cfg.siriusTNUUID = "tn-1"
+	cfg.CN.UUID = "cn-1"
+	client.getDetails = func(context.Context) (logpb.ClusterDetails, error) {
+		return logpb.ClusterDetails{TNStores: []logpb.TNStore{{
+			UUID: "tn-1", State: logpb.NormalState,
+			Shards: []logpb.TNShardInfo{{ShardID: 1, ReplicaID: 2}},
+		}}}, nil
+	}
+	dependencies, err := cfg.acquireSiriusCNReadDependencies(client)
 	require.NoError(t, err)
-	require.Len(t, options, 1)
+	shared, err := fileservice.NewMemoryFS(defines.SharedFileServiceName, fileservice.CacheConfig{}, nil)
+	require.NoError(t, err)
+	options, err := cfg.siriusCNServiceOptions(shared, dependencies)
+	require.NoError(t, err)
+	require.Len(t, options, 4)
+	wrongFS, err := fileservice.NewMemoryFS("NOT-SHARED", fileservice.CacheConfig{}, nil)
+	require.NoError(t, err)
+	_, err = cfg.siriusCNServiceOptions(wrongFS, dependencies)
+	require.Error(t, err)
+	require.ErrorContains(t, dependencies.capability.Healthy(), "revoked",
+		"post-acquisition option failure must leave no published generation without a CN owner")
+
+	staleBroker := substrait.NewLeaseManagerBroker()
+	stalePublication, err := staleBroker.Prepare(tnservice.SiriusTAELeaseStorageIdentity(shard), manager)
+	require.NoError(t, err)
+	require.NoError(t, stalePublication.Publish())
+	_, _, staleCapability, err := staleBroker.AcquireCapability()
+	require.NoError(t, err)
+	cfg.siriusLeaseBroker = staleBroker
+	client.getDetails = func(context.Context) (logpb.ClusterDetails, error) {
+		return logpb.ClusterDetails{TNStores: []logpb.TNStore{{
+			UUID: "stale-tn", State: logpb.NormalState,
+			Shards: []logpb.TNShardInfo{{ShardID: 1, ReplicaID: 2}},
+		}}}, nil
+	}
+	_, err = cfg.acquireSiriusCNReadDependencies(client)
+	require.ErrorContains(t, err, "live topology")
+	require.ErrorContains(t, staleCapability.Healthy(), "revoked")
+	_, _, _, err = staleBroker.AcquireCapability()
+	require.ErrorContains(t, err, "sealed")
 }
 
 func TestCNServiceCloseCompletionControlsBrokerSeal(t *testing.T) {

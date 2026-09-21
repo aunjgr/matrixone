@@ -69,6 +69,28 @@ func (p *siriusRuntimeTestProtector) Unregister(context.Context, []byte) error {
 	return nil
 }
 
+func siriusRuntimeTestCapabilityFor(
+	t *testing.T,
+	manager *substrait.LeaseManager,
+) *substrait.LeaseManagerCapability {
+	_, capability := siriusRuntimeTestBrokerCapabilityFor(t, manager)
+	return capability
+}
+
+func siriusRuntimeTestBrokerCapabilityFor(
+	t *testing.T,
+	manager *substrait.LeaseManager,
+) (*substrait.LeaseManagerBroker, *substrait.LeaseManagerCapability) {
+	t.Helper()
+	broker := substrait.NewLeaseManagerBroker()
+	publication, err := broker.Prepare("test-tae-shard/1/replica/1", manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	capability, err := broker.AttestTopology("test-tae-shard/1/replica/1", time.Minute)
+	require.NoError(t, err)
+	return broker, capability
+}
+
 type siriusRuntimeTestProvider struct{ schema []byte }
 
 func (p siriusRuntimeTestProvider) PrepareSnapshotRead(context.Context, substrait.Read, []byte) (substrait.SnapshotFacts, error) {
@@ -122,7 +144,8 @@ func TestSiriusRuntimeValidationAndLookup(t *testing.T) {
 	require.NoError(t, embeddedMO.Validate())
 	embeddedTAE := &SiriusRuntime{
 		Source: SiriusRuntimeEmbeddedTAE, Backend: &siriusAdmissionBackend{accepting: true},
-		Leases: leases, DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+		Leases: leases, LeaseCapability: siriusRuntimeTestCapabilityFor(t, leases),
+		DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
 	}
 	require.NoError(t, embeddedTAE.InitEmbeddedAdmission(16))
 	require.NoError(t, embeddedTAE.Validate())
@@ -148,6 +171,57 @@ func TestSiriusRuntimeValidationAndLookup(t *testing.T) {
 	require.True(t, ok)
 	require.Same(t, valid, actual)
 	require.True(t, rt.CompareAndDeleteGlobalVariables(SiriusRuntimeKey, valid))
+}
+
+func TestSiriusRuntimeRevokedStorageCapabilityRejectsNewLocalQueries(t *testing.T) {
+	manager := substrait.NewPersistentLeaseManager(
+		1, &siriusRuntimeTestProtector{}, siriusDurableJournalStub{})
+	require.NoError(t, manager.Replay(t.Context()))
+	broker, capability := siriusRuntimeTestBrokerCapabilityFor(t, manager)
+	proc := testutil.NewProcess(t)
+	t.Cleanup(proc.Free)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	previous, existed := rt.GetGlobalVariables(SiriusRuntimeKey)
+	flight := &SiriusRuntime{
+		Backend: new(siriusReconcileBackend), Leases: manager,
+		Resolver: &substrait.ResolverServer{}, LeaseCapability: capability,
+		AuthorizedClientSPKIHash: bytes.Repeat([]byte{1}, 32), DataDir: t.TempDir(),
+		LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+	}
+	require.NoError(t, flight.Validate())
+	rt.SetGlobalVariables(SiriusRuntimeKey, flight)
+	t.Cleanup(func() {
+		if existed {
+			rt.SetGlobalVariables(SiriusRuntimeKey, previous)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(SiriusRuntimeKey, flight)
+		}
+	})
+
+	refuse, err := broker.RevokeStorage(capability.StorageIdentity())
+	require.NoError(t, err)
+	require.True(t, refuse)
+	actual, ok := lookupSiriusRuntime(proc.GetService())
+	require.Same(t, flight, actual)
+	require.False(t, ok)
+	c := allocateNewCompile(proc)
+	c.stmt = &tree.Select{}
+	offloaded, err := c.tryCompileSiriusRead(WithSiriusOffload(context.Background()), nil)
+	require.False(t, offloaded)
+	require.ErrorContains(t, err, "capability is revoked")
+
+	moBroker, moCapability := siriusRuntimeTestBrokerCapabilityFor(t, manager)
+	mo := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedMO, Backend: new(siriusReconcileBackend),
+		CleanupTimeout: time.Second, LeaseCapability: moCapability,
+	}
+	require.NoError(t, mo.InitEmbeddedAdmission(1))
+	require.NoError(t, mo.Validate())
+	refuse, err = moBroker.RevokeStorage(moCapability.StorageIdentity())
+	require.NoError(t, err)
+	require.True(t, refuse)
+	require.ErrorContains(t, mo.Validate(), "capability is revoked")
+	require.False(t, mo.embeddedAdmission.accepting())
 }
 
 type siriusReconcileBackend struct {
@@ -214,7 +288,7 @@ func TestSiriusReplayReconcilesOnlyFlightAndEmbeddedTAERejectsIt(t *testing.T) {
 	embedded := &SiriusRuntime{
 		Source: SiriusRuntimeEmbeddedTAE, Backend: new(siriusReconcileBackend),
 		Leases: embeddedManager, DataDir: t.TempDir(), LeaseTTL: time.Minute,
-		CleanupTimeout: time.Second,
+		CleanupTimeout: time.Second, LeaseCapability: siriusRuntimeTestCapabilityFor(t, embeddedManager),
 	}
 	require.NoError(t, embedded.InitEmbeddedAdmission(16))
 	require.ErrorContains(t, embedded.ReconcileReplay(context.Background()), "unreconciled Flight reads")
@@ -257,7 +331,8 @@ func TestEmbeddedTAEAbortSealsRuntimeWhenLocalReleaseNeedsRetry(t *testing.T) {
 			closes.Add(1)
 			return nil
 		}},
-		Leases: leases, DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
+		Leases: leases, LeaseCapability: siriusRuntimeTestCapabilityFor(t, leases),
+		DataDir: t.TempDir(), LeaseTTL: time.Minute, CleanupTimeout: time.Second,
 	}
 	owner := &SiriusReadPlan{ReadRefs: admitted.ReadRefs, LeaseExpiresAt: admitted.ExpiresAt}
 	err = runtime.abortEmbeddedAdmittedRead(context.Background(), owner, errors.New("descriptor invariant"))

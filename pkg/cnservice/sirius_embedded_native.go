@@ -50,6 +50,7 @@ func (s *service) startEmbeddedSiriusRuntime(ctx context.Context) error {
 	}
 	runtime := &compile.SiriusRuntime{
 		Source: source, Backend: &embeddedBackend{native: native}, CleanupTimeout: c.CleanupTimeout.Duration,
+		LeaseCapability: s.options.siriusCapability,
 	}
 	if err = runtime.InitEmbeddedAdmission(c.MaxWaitingQueries); err != nil {
 		return errors.Join(err, closeUnpublishedEmbeddedSirius(native, c.CleanupTimeout.Duration))

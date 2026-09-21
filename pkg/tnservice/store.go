@@ -590,6 +590,19 @@ func waitCreateRetry(stopperCtx, createCtx context.Context) error {
 
 func (s *store) removeReplicaLocked(tnShardID uint64) error {
 	if r := s.getReplica(tnShardID); r != nil {
+		if s.options.siriusLeaseBroker != nil {
+			refuse, err := s.options.siriusLeaseBroker.RevokeStorage(
+				SiriusTAELeaseStorageIdentity(r.shard),
+			)
+			if err != nil {
+				return err
+			}
+			if refuse {
+				return moerr.NewInvalidStateNoCtx(
+					"cannot remove the TAE shard while its Sirius storage generation may still be in use",
+				)
+			}
+		}
 		err := r.close(true)
 		s.replicas.CompareAndDelete(tnShardID, r)
 		s.removeTNShardLocked(tnShardID)

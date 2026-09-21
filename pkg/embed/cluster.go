@@ -427,6 +427,7 @@ func (c *cluster) configureSiriusCoLocationLocked() error {
 	for _, op := range c.services {
 		op.siriusLeaseBroker = nil
 		op.siriusCoLocatedTAE = false
+		op.siriusTNUUID = ""
 		switch op.serviceType {
 		case metadata.ServiceType_LOG:
 			logOps = append(logOps, op)
@@ -465,6 +466,7 @@ func (c *cluster) configureSiriusCoLocationLocked() error {
 		tnOps[0].siriusLeaseBroker = c.siriusLeaseBroker
 		cnOps[0].siriusLeaseBroker = c.siriusLeaseBroker
 		cnOps[0].siriusCoLocatedTAE = directTAE
+		cnOps[0].siriusTNUUID = tnOps[0].cfg.getTNServiceConfig().UUID
 	}
 	for _, op := range cnOps {
 		if err := cnservice.VerifySiriusCoLocatedTAE(&op.cfg.CN, op.siriusCoLocatedTAE); err != nil {

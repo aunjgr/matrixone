@@ -52,6 +52,9 @@ type PreGCBootstrapContext struct {
 	SharedFileService fileservice.FileService
 	Shard             metadata.TNShard
 	Protector         GCReadProtector
+	// StorageGenerationSHA256 binds shared authority to the exact same-host
+	// persistent TAE directory generation whose kernel lock is held here.
+	StorageGenerationSHA256 []byte
 }
 
 type PreGCBootstrapHook func(context.Context, PreGCBootstrapContext) error
@@ -106,14 +109,15 @@ type Options struct {
 	IsStandalone              bool
 	GCTimeCheckerFactory      func(any) func(*types.TS) bool
 
-	Fs                fileservice.FileService                  `toml:"-"`
-	LocalFs           fileservice.FileService                  `toml:"-"`
-	TmpFs             *fileservice.TmpFileService              `toml:"-"`
-	WalClientFactory  logservicedriver.LogServiceClientFactory `toml:"-"`
-	Ctx               context.Context                          `toml:"-"`
-	Shard             metadata.TNShard                         `toml:"-"`
-	Clock             clock.Clock                              `toml:"-"`
-	TaskServiceGetter taskservice.Getter                       `toml:"-"`
-	SID               string                                   `toml:"-"`
-	PreGCBootstrap    PreGCBootstrapHook                       `toml:"-"`
+	Fs                      fileservice.FileService                  `toml:"-"`
+	LocalFs                 fileservice.FileService                  `toml:"-"`
+	TmpFs                   *fileservice.TmpFileService              `toml:"-"`
+	WalClientFactory        logservicedriver.LogServiceClientFactory `toml:"-"`
+	Ctx                     context.Context                          `toml:"-"`
+	Shard                   metadata.TNShard                         `toml:"-"`
+	Clock                   clock.Clock                              `toml:"-"`
+	TaskServiceGetter       taskservice.Getter                       `toml:"-"`
+	SID                     string                                   `toml:"-"`
+	PreGCBootstrap          PreGCBootstrapHook                       `toml:"-"`
+	StorageGenerationSHA256 []byte                                   `toml:"-"`
 }

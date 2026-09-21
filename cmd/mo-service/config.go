@@ -107,6 +107,7 @@ type Config struct {
 	// field is not TOML-visible, so a standalone CN config cannot assert access
 	// to a process-local TAE manager.
 	siriusLeaseBroker *substrait.LeaseManagerBroker
+	siriusTNUUID      string
 
 	// DataDir data dir
 	DataDir string `toml:"data-dir"`

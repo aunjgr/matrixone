@@ -30,6 +30,8 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/cnservice"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	logpb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 	"github.com/matrixorigin/matrixone/pkg/testutil/clusteradmission"
@@ -73,6 +75,15 @@ func (embedSiriusProtector) Begin(context.Context) (
 func (embedSiriusProtector) Unregister(context.Context, []byte) error { return nil }
 
 type embedSiriusJournal struct{}
+
+type embedSiriusTopologyClient struct {
+	logservice.CNHAKeeperClient
+	details logpb.ClusterDetails
+}
+
+func (c embedSiriusTopologyClient) GetClusterDetails(context.Context) (logpb.ClusterDetails, error) {
+	return c.details, nil
+}
 
 func (embedSiriusJournal) StoreIfCapacity(_ context.Context, leases []*substrait.Lease, _ int) (int, error) {
 	return len(leases), nil
@@ -294,6 +305,26 @@ func TestEmbeddedSiriusTAEStartsTNPublicationBeforeCN(t *testing.T) {
 	require.Equal(t, []metadata.ServiceType{
 		metadata.ServiceType_LOG, metadata.ServiceType_TN, metadata.ServiceType_CN,
 	}, order)
+}
+
+func TestEmbeddedSiriusStaleLiveTopologyRevokesCapability(t *testing.T) {
+	manager := substrait.NewPersistentLeaseManager(1, embedSiriusProtector{}, embedSiriusJournal{})
+	require.NoError(t, manager.Replay(t.Context()))
+	broker := substrait.NewLeaseManagerBroker()
+	shard := metadata.TNShard{TNShardRecord: metadata.TNShardRecord{ShardID: 5}, ReplicaID: 6}
+	publication, err := broker.Prepare(tnservice.SiriusTAELeaseStorageIdentity(shard), manager)
+	require.NoError(t, err)
+	require.NoError(t, publication.Publish())
+	_, _, capability, err := broker.AcquireCapability()
+	require.NoError(t, err)
+	op := &operator{siriusLeaseBroker: broker, siriusTNUUID: "tn-current"}
+	client := embedSiriusTopologyClient{details: logpb.ClusterDetails{TNStores: []logpb.TNStore{{
+		UUID: "tn-stale", State: logpb.NormalState,
+		Shards: []logpb.TNShardInfo{{ShardID: shard.ShardID, ReplicaID: shard.ReplicaID}},
+	}}}}
+	_, err = op.acquireSiriusReadDependencies(client)
+	require.ErrorContains(t, err, "live topology")
+	require.ErrorContains(t, capability.Healthy(), "revoked")
 }
 
 func TestEmbeddedSiriusTAERejectsUnsafeTopology(t *testing.T) {

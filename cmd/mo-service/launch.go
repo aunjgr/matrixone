@@ -102,7 +102,7 @@ func startCluster(
 			return err
 		}
 	}
-	if err := startCNServiceConfigs(ctx, launchPlan.cn, stopper, shutdownC, tnGCDisabled, proxyOwns6001, launchPlan.broker); err != nil {
+	if err := startCNServiceConfigs(ctx, launchPlan.cn, stopper, shutdownC, tnGCDisabled, proxyOwns6001, launchPlan.broker, launchPlan.tnUUID); err != nil {
 		return err
 	}
 	if *withProxy {
@@ -121,6 +121,7 @@ type staticSiriusLaunch struct {
 	tn     []*Config
 	cn     []*Config
 	broker *substrait.LeaseManagerBroker
+	tnUUID string
 }
 
 func prepareStaticSiriusLaunch(cfg *LaunchConfig) (*staticSiriusLaunch, error) {
@@ -167,6 +168,7 @@ func prepareStaticSiriusLaunch(cfg *LaunchConfig) (*staticSiriusLaunch, error) {
 	plan := &staticSiriusLaunch{tn: tnConfigs, cn: cnConfigs}
 	if safe {
 		plan.broker = substrait.NewLeaseManagerBroker()
+		plan.tnUUID = tnConfigs[0].getTNServiceConfig().UUID
 	}
 	for _, cn := range cnConfigs {
 		if err := cnservice.VerifySiriusCoLocatedTAE(&cn.CN, plan.broker != nil); err != nil {
@@ -294,7 +296,7 @@ func startCNServiceCluster(
 		return err
 	}
 	owns6001 := len(proxyOwns6001) > 0 && proxyOwns6001[0]
-	return startCNServiceConfigs(ctx, configs, stopper, shutdownC, tnGCDisabled, owns6001, nil)
+	return startCNServiceConfigs(ctx, configs, stopper, shutdownC, tnGCDisabled, owns6001, nil, "")
 }
 
 func startCNServiceConfigs(
@@ -305,12 +307,14 @@ func startCNServiceConfigs(
 	tnGCDisabled bool,
 	proxyOwns6001 bool,
 	broker *substrait.LeaseManagerBroker,
+	tnUUID string,
 ) error {
 	upstreams := make([]string, 0, len(configs))
 
 	for _, cfg := range configs {
 		cfg.benchmarkTNNoGC = tnGCDisabled
 		cfg.siriusLeaseBroker = broker
+		cfg.siriusTNUUID = tnUUID
 		upstreams = append(upstreams, fmt.Sprintf("127.0.0.1:%d", cfg.getCNServiceConfig().Frontend.Port))
 	}
 	for _, cfg := range configs {

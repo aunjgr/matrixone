@@ -765,8 +765,9 @@ func (c *Controller) AssembleDB(ctx context.Context) (err error) {
 	// AssembleDB rollback stops every component started above.
 	if hook := db.Opts.PreGCBootstrap; hook != nil {
 		if err = hook(ctx, options.PreGCBootstrapContext{
-			SharedFileService: db.Opts.Fs,
-			Shard:             db.Opts.Shard,
+			SharedFileService:       db.Opts.Fs,
+			Shard:                   db.Opts.Shard,
+			StorageGenerationSHA256: append([]byte(nil), db.Opts.StorageGenerationSHA256...),
 			Protector: gc2.SidecarReadProtector{
 				Manager: cleaner.GetSyncProtectionManager(),
 			},

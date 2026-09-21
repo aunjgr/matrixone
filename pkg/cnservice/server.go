@@ -468,6 +468,9 @@ func (s *service) Start() (err error) {
 	}); err != nil {
 		return err
 	}
+	if err = s.startSiriusTopologyMonitor(); err != nil {
+		return err
+	}
 
 	s.initSqlWriterFactory()
 
@@ -521,6 +524,7 @@ func (s *service) closeService() error {
 		// ingress published until all local entry points and work have drained;
 		// withdrawal below is the ownership handoff linearization point.
 		s.stopper.Stop()
+		s.closeSiriusTopologyHandoff()
 
 		// A failed producer drain must not tear down its dependencies. Unknown
 		// local errors remain fail-stop; only remote withdrawal is diagnostic.

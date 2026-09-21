@@ -31,6 +31,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/common/system"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/gossip"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
@@ -56,6 +57,7 @@ type operator struct {
 	testing            bool
 	siriusLeaseBroker  *substrait.LeaseManagerBroker
 	siriusCoLocatedTAE bool
+	siriusTNUUID       string
 
 	reset struct {
 		svc        service
@@ -238,8 +240,12 @@ func (op *operator) Start() error {
 			if op.siriusLeaseBroker == nil {
 				return moerr.NewInvalidStateNoCtx("embedded Sirius TAE input has no co-located lease-manager broker")
 			}
-			if _, _, err := op.siriusLeaseBroker.Acquire(); err != nil {
+			_, _, capability, err := op.siriusLeaseBroker.AcquireCapability()
+			if err != nil {
 				return moerr.NewInvalidStateNoCtxf("embedded Sirius TAE CN replacement is unavailable: %v", err)
+			}
+			if err := capability.Healthy(); err != nil {
+				return err
 			}
 		}
 	}
@@ -356,7 +362,19 @@ func (op *operator) startCNServiceLocked(
 		return err
 	}
 	c := op.cfg.getCNServiceConfig()
-	if err := op.waitClusterConditionLocked(op.waitAnyShardReadyLocked); err != nil {
+	var siriusDependencies *embeddedSiriusReadDependencies
+	waitForStorage := op.waitAnyShardReadyLocked
+	if op.siriusLeaseBroker != nil {
+		waitForStorage = func(client logservice.CNHAKeeperClient) error {
+			if err := op.waitAnyShardReadyLocked(client); err != nil {
+				return err
+			}
+			var err error
+			siriusDependencies, err = op.acquireSiriusReadDependencies(client)
+			return err
+		}
+	}
+	if err := op.waitClusterConditionLocked(waitForStorage); err != nil {
 		return err
 	}
 	op.cfg.initMetaCache()
@@ -368,12 +386,33 @@ func (op *operator) startCNServiceLocked(
 		cnservice.WithTxnTraceData(filepath.Join(op.cfg.DataDir, c.Txn.Trace.Dir)),
 	}
 	if op.siriusLeaseBroker != nil {
-		leases, _, err := op.siriusLeaseBroker.Acquire()
-		if err != nil {
+		if siriusDependencies == nil || siriusDependencies.leases == nil ||
+			siriusDependencies.capability == nil || siriusDependencies.validator == nil ||
+			siriusDependencies.handoff == nil {
+			if siriusDependencies != nil {
+				siriusDependencies.handoff.Stop()
+			}
 			op.siriusLeaseBroker.Seal()
-			return moerr.NewInvalidStateNoCtxf("acquire co-located Sirius TAE lease manager: %v", err)
+			return moerr.NewInvalidStateNoCtx("co-located Sirius TAE read dependencies are unavailable")
 		}
-		options = append(options, cnservice.WithSiriusReadDependencies(leases, nil))
+		auditFS, err := fileservice.Get[fileservice.FileService](fs, defines.SharedFileServiceName)
+		if err != nil {
+			siriusDependencies.handoff.Stop()
+			op.siriusLeaseBroker.Seal()
+			return err
+		}
+		auditor, err := substrait.NewFileServiceResolveAuditRecorder(auditFS, c.UUID)
+		if err != nil {
+			siriusDependencies.handoff.Stop()
+			op.siriusLeaseBroker.Seal()
+			return err
+		}
+		options = append(options,
+			cnservice.WithSiriusReadDependencies(siriusDependencies.leases, auditor),
+			cnservice.WithSiriusLeaseManagerCapability(siriusDependencies.capability),
+			cnservice.WithSiriusTopologyValidator(siriusDependencies.validator),
+			cnservice.WithSiriusTopologyRenewalHandoff(siriusDependencies.handoff),
+		)
 	}
 	s, err := cnservice.NewService(
 		&c,
@@ -383,12 +422,78 @@ func (op *operator) startCNServiceLocked(
 		options...,
 	)
 	if err != nil {
+		if siriusDependencies != nil {
+			siriusDependencies.handoff.Stop()
+		}
+		if op.siriusLeaseBroker != nil {
+			op.siriusLeaseBroker.Seal()
+		}
 		return err
 	}
 	if err := op.startConstructedServiceLocked(s); err != nil {
 		return err
 	}
 	return nil
+}
+
+type embeddedSiriusReadDependencies struct {
+	leases     *substrait.LeaseManager
+	capability *substrait.LeaseManagerCapability
+	validator  cnservice.SiriusTopologyValidator
+	handoff    *substrait.LeaseManagerCapabilityHandoff
+}
+
+func (op *operator) acquireSiriusReadDependencies(
+	client logservice.CNHAKeeperClient,
+) (*embeddedSiriusReadDependencies, error) {
+	if op.siriusLeaseBroker == nil || client == nil {
+		return nil, moerr.NewInvalidStateNoCtx("co-located Sirius TAE topology authority is unavailable")
+	}
+	leases, identity, err := op.siriusLeaseBroker.Acquire()
+	if err != nil {
+		return nil, err
+	}
+	succeeded := false
+	var handoff *substrait.LeaseManagerCapabilityHandoff
+	defer func() {
+		if !succeeded {
+			handoff.Stop()
+			op.siriusLeaseBroker.Seal()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	validator := func(validateCtx context.Context, validateClient logservice.CNHAKeeperClient) error {
+		if validateClient == nil {
+			return moerr.NewInvalidStateNoCtx("co-located Sirius HAKeeper topology authority is unavailable")
+		}
+		details, validateErr := validateClient.GetClusterDetails(validateCtx)
+		if validateErr != nil {
+			return validateErr
+		}
+		return tnservice.ValidateSiriusTAELiveTopology(
+			details, op.siriusTNUUID, identity)
+	}
+	if err := validator(ctx, client); err != nil {
+		return nil, err
+	}
+	capability, err := op.siriusLeaseBroker.AttestTopology(
+		identity, cnservice.DefaultSiriusTopologyValidity)
+	if err != nil {
+		return nil, err
+	}
+	handoff, err = substrait.StartTopologyRenewalHandoff(
+		capability,
+		cnservice.DefaultSiriusTopologyValidity,
+		cnservice.DefaultSiriusTopologyCheckInterval,
+	)
+	if err != nil {
+		return nil, err
+	}
+	succeeded = true
+	return &embeddedSiriusReadDependencies{
+		leases: leases, capability: capability, validator: validator, handoff: handoff,
+	}, nil
 }
 
 func (op *operator) verifySiriusBenchmarkNoGC() error {

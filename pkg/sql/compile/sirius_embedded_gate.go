@@ -74,7 +74,41 @@ func (r *SiriusRuntime) acquireEmbeddedAdmission(
 		return nil, moerr.NewInvalidStateNoCtx(
 			"substrait: embedded Sirius admission is uninitialized")
 	}
-	return r.embeddedAdmission.acquire(ctx)
+	if r.Source == SiriusRuntimeEmbeddedTAE && r.LeaseCapability == nil {
+		r.embeddedAdmission.seal()
+		return nil, moerr.NewInvalidStateNoCtx(
+			"substrait: embedded TAE Sirius runtime has no live storage capability")
+	}
+	if r.LeaseCapability != nil {
+		var capabilityErr error
+		if r.Source == SiriusRuntimeEmbeddedMO {
+			capabilityErr = r.LeaseCapability.Healthy()
+		} else {
+			capabilityErr = r.LeaseCapability.HealthyFor(r.Leases)
+		}
+		if capabilityErr != nil {
+			r.embeddedAdmission.seal()
+			return nil, capabilityErr
+		}
+	}
+	permit, err := r.embeddedAdmission.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if r.LeaseCapability != nil {
+		var capabilityErr error
+		if r.Source == SiriusRuntimeEmbeddedMO {
+			capabilityErr = r.LeaseCapability.Healthy()
+		} else {
+			capabilityErr = r.LeaseCapability.HealthyFor(r.Leases)
+		}
+		if capabilityErr != nil {
+			permit.release()
+			r.embeddedAdmission.seal()
+			return nil, capabilityErr
+		}
+	}
+	return permit, nil
 }
 
 func (g *siriusEmbeddedAdmissionGate) acquire(ctx context.Context) (*siriusEmbeddedAdmissionPermit, error) {

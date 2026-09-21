@@ -86,6 +86,7 @@ type SiriusRuntime struct {
 	LeaseTTL                 time.Duration
 	CleanupTimeout           time.Duration
 	embeddedAdmission        *siriusEmbeddedAdmissionGate
+	LeaseCapability          *substrait.LeaseManagerCapability
 	// BenchmarkNoGC is set only by the CN launcher after it verifies that the
 	// paired TN has disabled GC. It permits the explicitly non-durable,
 	// process-local lease manager used by the local-CN benchmark profile.
@@ -119,6 +120,10 @@ func (r *SiriusRuntime) Validate() error {
 		if r.embeddedAdmission == nil || !r.embeddedAdmission.accepting() {
 			return moerr.NewInvalidStateNoCtx("substrait: embedded Sirius admission is sealed or uninitialized")
 		}
+		if r.LeaseCapability == nil && r.Source == SiriusRuntimeEmbeddedTAE {
+			r.embeddedAdmission.seal()
+			return moerr.NewInvalidStateNoCtx("substrait: embedded TAE Sirius runtime has no live storage capability")
+		}
 		if r.BenchmarkNoGC {
 			return moerr.NewInternalErrorNoCtx("substrait: embedded Sirius cannot use benchmark lease mode")
 		}
@@ -126,6 +131,10 @@ func (r *SiriusRuntime) Validate() error {
 			(r.Leases == nil || !r.Leases.DurableReady() || r.DataDir == "" ||
 				r.LeaseTTL <= r.CleanupTimeout || r.LeaseTTL > substrait.MaxLeaseTTL) {
 			return moerr.NewInternalErrorNoCtx("substrait: incomplete embedded TAE Sirius runtime")
+		}
+		if err := r.validateLeaseCapability(); err != nil {
+			r.embeddedAdmission.seal()
+			return err
 		}
 		if health, ok := r.Backend.(interface{ Accepting() bool }); ok && !health.Accepting() {
 			return moerr.NewInvalidStateNoCtx("substrait: embedded Sirius admission is sealed")
@@ -144,7 +153,20 @@ func (r *SiriusRuntime) Validate() error {
 	} else if !r.Leases.DurableReady() {
 		return moerr.NewInternalErrorNoCtx("substrait: incomplete CN Sirius runtime")
 	}
+	if err := r.validateLeaseCapability(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (r *SiriusRuntime) validateLeaseCapability() error {
+	if r == nil || r.LeaseCapability == nil {
+		return nil
+	}
+	if r.Source == SiriusRuntimeEmbeddedMO {
+		return r.LeaseCapability.Healthy()
+	}
+	return r.LeaseCapability.HealthyFor(r.Leases)
 }
 
 func nonzeroSiriusSPKI(hash []byte) bool {
@@ -338,6 +360,11 @@ func (c *Compile) tryCompileSiriusRead(ctx context.Context, queryPlan *planpb.Pl
 		return false, nil
 	}
 	runtime, ok := lookupSiriusRuntime(c.proc.GetService())
+	if runtime != nil && runtime.LeaseCapability != nil {
+		if err := runtime.Validate(); err != nil {
+			return false, err
+		}
+	}
 	if runtime != nil && runtime.Source.embedded() {
 		// An explicitly selected embedded runtime must not turn failed
 		// admission into an invisible CPU fallback.
@@ -466,6 +493,19 @@ func (r *SiriusRuntime) sealEmbeddedAdmission() {
 	if r != nil && r.embeddedAdmission != nil {
 		r.embeddedAdmission.seal()
 	}
+}
+
+// RevokeLeaseCapability is the service-owned topology-fence terminal path.
+// Existing owners retain their cleanup/protection references; new local Flight
+// and embedded admission observes the revoked capability and fails closed.
+func (r *SiriusRuntime) RevokeLeaseCapability() {
+	if r == nil {
+		return
+	}
+	if r.LeaseCapability != nil {
+		r.LeaseCapability.RevokeTopology()
+	}
+	r.sealEmbeddedAdmission()
 }
 
 func (r *SiriusRuntime) prepareEmbeddedExecution(

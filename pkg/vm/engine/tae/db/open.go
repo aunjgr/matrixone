@@ -103,6 +103,15 @@ func Open(
 			return
 		}
 	}
+	if opts.PreGCBootstrap != nil {
+		if dbLocker == nil {
+			err = fmt.Errorf("TAE storage authority requires a write-mode directory lock")
+			return
+		}
+		if opts.StorageGenerationSHA256, err = loadOrCreateStorageGeneration(dirname); err != nil {
+			return
+		}
+	}
 
 	transferTable, err := model.NewTransferTable[*model.TransferHashPage](ctx, opts.LocalFs)
 	if err != nil {

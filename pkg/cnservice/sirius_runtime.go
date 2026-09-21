@@ -52,6 +52,11 @@ func siriusInternalErrorf(format string, args ...any) error {
 
 func (s *service) startSiriusRuntime(ctx context.Context) error {
 	config := s.cfg.Sirius
+	if s.options.siriusCapability != nil {
+		if err := s.options.siriusCapability.HealthyFor(s.options.siriusLeases); err != nil {
+			return err
+		}
+	}
 	// The storage owner replays leases before publishing its manager. Reconcile
 	// stale in-process work before every local/no-runtime startup mode as well,
 	// so disabling Sirius or switching to MO readers cannot strand old direct
@@ -121,6 +126,7 @@ func (s *service) startSiriusRuntime(ctx context.Context) error {
 	}
 	runtime := &compile.SiriusRuntime{
 		Backend: compile.NewSiriusFlightBackend(flight), Leases: s.options.siriusLeases, Resolver: resolver,
+		LeaseCapability:          s.options.siriusCapability,
 		AuthorizedClientSPKIHash: authorizedSPKI, DataDir: config.DataDir,
 		LeaseTTL: config.LeaseTTL.Duration, CleanupTimeout: config.CleanupTimeout.Duration,
 		BenchmarkNoGC: config.BenchmarkNoGC,

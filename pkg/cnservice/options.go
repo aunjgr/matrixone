@@ -16,6 +16,7 @@ package cnservice
 
 import (
 	"context"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/bootstrap"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -37,6 +38,16 @@ import (
 
 // Option option to create cn service
 type Option func(*service)
+
+const (
+	DefaultSiriusTopologyCheckInterval = time.Second
+	// CN bootstrap can legitimately take several seconds before the monitor is
+	// scheduled. The durable storage-authority marker prevents a replacement
+	// from opening during this bounded initial lease.
+	DefaultSiriusTopologyValidity = 30 * time.Second
+)
+
+type SiriusTopologyValidator func(context.Context, logservice.CNHAKeeperClient) error
 
 // WithLogger setup cn service's logger
 func WithLogger(logger *zap.Logger) Option {
@@ -77,6 +88,34 @@ func WithSiriusReadDependencies(leases *substrait.LeaseManager, auditor substrai
 	return func(s *service) {
 		s.options.siriusLeases = leases
 		s.options.siriusAuditor = auditor
+	}
+}
+
+// WithSiriusLeaseManagerCapability supplies revocable proof that the injected
+// manager still belongs to the launcher-verified live TAE storage generation.
+// Embedded TAE requires it; embedded MO retains it when local recovery wiring
+// is present so topology revocation also closes that runtime's admission.
+func WithSiriusLeaseManagerCapability(capability *substrait.LeaseManagerCapability) Option {
+	return func(s *service) {
+		s.options.siriusCapability = capability
+	}
+}
+
+// WithSiriusTopologyValidator installs the authoritative post-start HAKeeper
+// fence. A local manager capability without this validator cannot be renewed
+// and expires fail closed.
+func WithSiriusTopologyValidator(validator SiriusTopologyValidator) Option {
+	return func(s *service) {
+		s.options.siriusTopologyValidator = validator
+	}
+}
+
+// WithSiriusTopologyRenewalHandoff transfers the launcher-owned construction
+// renewal loop to the CN service. The service stops it only after its own
+// authoritative monitor is live, or during failed-start cleanup.
+func WithSiriusTopologyRenewalHandoff(handoff *substrait.LeaseManagerCapabilityHandoff) Option {
+	return func(s *service) {
+		s.options.siriusTopologyHandoff = handoff
 	}
 }
 
