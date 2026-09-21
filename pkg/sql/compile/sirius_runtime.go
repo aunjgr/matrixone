@@ -295,6 +295,12 @@ func (o *siriusReadOwner) finish(ctx context.Context, succeeded bool) error {
 		o.cleanupMu.Unlock()
 
 		cleanupErr := o.cleanupAttempt(ctx, succeeded)
+		if cleanupErr != nil {
+			// Poison admission before publishing attempt completion. Otherwise a
+			// concurrent finish caller can observe cleanupDone, retry successfully,
+			// and hand the permit to queued storage work before this caller seals.
+			o.runtime.sealEmbeddedAdmission()
+		}
 		o.cleanupMu.Lock()
 		if cleanupErr == nil {
 			o.cleaned = true
@@ -303,9 +309,6 @@ func (o *siriusReadOwner) finish(ctx context.Context, succeeded bool) error {
 		close(done)
 		o.cleanupMu.Unlock()
 
-		if o.source.embedded() && cleanupErr != nil {
-			o.runtime.sealEmbeddedAdmission()
-		}
 		// Cleanup must complete (or fail and seal admission) before another
 		// embedded query can own the selected GPU. The permit is once-release,
 		// while a failed execution owner remains available for cleanup retry.

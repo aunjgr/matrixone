@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -432,6 +433,86 @@ func TestSiriusReadOwnerConcurrentCleanupWaitHonorsContext(t *testing.T) {
 	require.NoError(t, receiveSiriusGateResult(t, first))
 	require.NoError(t, owner.finish(context.Background(), false))
 	require.Equal(t, int32(1), cleanups.Load(), "successful cleanup is terminal")
+}
+
+type siriusObservedDoneContext struct {
+	context.Context
+	once     sync.Once
+	observed chan struct{}
+}
+
+func (c *siriusObservedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
+func TestSiriusReadOwnerFailureSealsBeforeConcurrentRetry(t *testing.T) {
+	siriusRuntime := &SiriusRuntime{
+		Source: SiriusRuntimeEmbeddedTAE, CleanupTimeout: time.Second,
+	}
+	require.NoError(t, siriusRuntime.InitEmbeddedAdmission(1))
+	permit, err := siriusRuntime.acquireEmbeddedAdmission(context.Background())
+	require.NoError(t, err)
+
+	var storageStarts atomic.Int32
+	admission := make(chan error, 1)
+	go func() {
+		next, acquireErr := siriusRuntime.acquireEmbeddedAdmission(context.Background())
+		if next != nil {
+			storageStarts.Add(1)
+			next.release()
+		}
+		admission <- acquireErr
+	}()
+	waitForSiriusGateWaiters(t, siriusRuntime.embeddedAdmission, 1)
+
+	firstCleanupStarted := make(chan struct{})
+	failFirstCleanup := make(chan struct{})
+	retrySawSealed := make(chan bool, 1)
+	var cleanupAttempts atomic.Int32
+	execution := &siriusExecutionStub{
+		run: func(context.Context, *mpool.MPool, *perfcounter.CounterSet, func(*batch.Batch, *perfcounter.CounterSet) error) error {
+			return nil
+		},
+		cleanup: func(context.Context, bool) error {
+			switch cleanupAttempts.Add(1) {
+			case 1:
+				close(firstCleanupStarted)
+				<-failFirstCleanup
+				return errors.New("first cleanup failed")
+			case 2:
+				retrySawSealed <- !siriusRuntime.embeddedAdmission.accepting()
+				return nil
+			default:
+				return errors.New("unexpected cleanup attempt")
+			}
+		},
+	}
+	owner := newSiriusEmbeddedReadOwner(execution, siriusRuntime, permit)
+	first := make(chan error, 1)
+	go func() { first <- owner.finish(context.Background(), false) }()
+	receiveSiriusGateResult(t, firstCleanupStarted)
+
+	// Done() is evaluated only after the competing finish caller observes the
+	// active attempt and enters its cancellation-aware wait. This is a phase
+	// barrier, not a scheduling delay.
+	secondWaiting := make(chan struct{})
+	secondCtx := &siriusObservedDoneContext{
+		Context: context.Background(), observed: secondWaiting,
+	}
+	second := make(chan error, 1)
+	go func() { second <- owner.finish(secondCtx, false) }()
+	receiveSiriusGateResult(t, secondWaiting)
+	close(failFirstCleanup)
+
+	require.ErrorContains(t, receiveSiriusGateResult(t, first), "first cleanup failed")
+	require.True(t, receiveSiriusGateResult(t, retrySawSealed),
+		"failed cleanup must poison admission before publishing cleanupDone")
+	require.NoError(t, receiveSiriusGateResult(t, second),
+		"the poisoned owner remains retryable for resource cleanup")
+	require.ErrorContains(t, receiveSiriusGateResult(t, admission), "admission is sealed")
+	require.Zero(t, storageStarts.Load(), "a cleanup retry must never hand off poisoned admission")
+	require.Equal(t, int32(2), cleanupAttempts.Load())
 }
 
 func TestSiriusEmbeddedMOAndTAEShareAdmissionGate(t *testing.T) {
