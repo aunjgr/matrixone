@@ -24,6 +24,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
@@ -51,8 +52,10 @@ type fileServiceLeaseJournal struct {
 }
 
 // journalAdmissionCoordinator serializes admission and replay critical
-// sections across every CN that can access one durable namespace.
-// Implementations must keep the named
+// sections over the ownership scope promised by its factory. A general
+// deployment implementation must cover every CN that can access one durable
+// namespace; NewSingleProcessFileServiceLeaseJournal deliberately restricts
+// that scope to one co-located process. Implementations must keep the named
 // exclusion held until fn returns and must not run two callbacks with the same
 // key concurrently, even when they originate in different processes. Waiting
 // must honor ctx. The callback context must remain valid only while ownership
@@ -64,6 +67,76 @@ type fileServiceLeaseJournal struct {
 type journalAdmissionCoordinator interface {
 	RunExclusive(context.Context, string, func(context.Context) error) error
 }
+
+// singleProcessJournalAdmission deliberately provides exclusion only between
+// journal users in this process. FileService does not expose a compare-and-swap
+// primitive, so this coordinator must never be used when two processes can
+// write the same namespace (including rolling replacement of a process).
+//
+// Entries are reference-counted so unsuccessful/cancelled admissions do not
+// leave an unbounded process-global namespace registry behind.
+type singleProcessJournalAdmission struct {
+	mu      sync.Mutex
+	entries map[string]*singleProcessJournalAdmissionEntry
+}
+
+type singleProcessJournalAdmissionEntry struct {
+	lock contextMutex
+	refs int
+}
+
+func (a *singleProcessJournalAdmission) RunExclusive(
+	ctx context.Context,
+	key string,
+	fn func(context.Context) error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil {
+		return moerr.NewInternalErrorNoCtx("substrait: missing lease journal admission callback")
+	}
+	a.mu.Lock()
+	if a.entries == nil {
+		a.entries = make(map[string]*singleProcessJournalAdmissionEntry)
+	}
+	entry := a.entries[key]
+	if entry == nil {
+		entry = &singleProcessJournalAdmissionEntry{lock: newContextMutex()}
+		a.entries[key] = entry
+	}
+	entry.refs++
+	a.mu.Unlock()
+
+	if err := entry.lock.lock(ctx); err != nil {
+		a.release(key, entry)
+		return err
+	}
+	if err := context.Cause(ctx); err != nil {
+		entry.lock.unlock()
+		a.release(key, entry)
+		return err
+	}
+	defer func() {
+		entry.lock.unlock()
+		a.release(key, entry)
+	}()
+	return fn(ctx)
+}
+
+func (a *singleProcessJournalAdmission) release(
+	key string,
+	entry *singleProcessJournalAdmissionEntry,
+) {
+	a.mu.Lock()
+	entry.refs--
+	if entry.refs == 0 && a.entries[key] == entry {
+		delete(a.entries, key)
+	}
+	a.mu.Unlock()
+}
+
+var localProcessLeaseJournalAdmission singleProcessJournalAdmission
 
 type journalRecord struct {
 	Wire                     []byte   `json:"wire"`
@@ -95,9 +168,26 @@ func newFileServiceLeaseJournal(fs fileservice.FileService, prefix string, admis
 	}, nil
 }
 
+// NewSingleProcessFileServiceLeaseJournal creates the durable lease journal
+// used by the co-located one-TN/one-CN embedded deployment. Every journal made
+// by this factory serializes admission and replay with same-namespace journals
+// in this process.
+//
+// This factory is intentionally named for its safety boundary. It is unsafe
+// when separate processes, overlapping process generations, or a rolling
+// deployment can write the same FileService namespace. Such deployments need
+// a durable cross-process coordinator and must not call this function.
+func NewSingleProcessFileServiceLeaseJournal(
+	fs fileservice.FileService,
+	prefix string,
+) (LeaseJournal, error) {
+	return newFileServiceLeaseJournal(fs, prefix, &localProcessLeaseJournalAdmission)
+}
+
 // StoreIfCapacity is the journal-level admission linearization point. The
-// coordinator owns namespace-wide exclusion rather than a LeaseManager or one
-// journal object, so independent CNs cannot admit past the configured cap.
+// coordinator owns exclusion over the factory's declared deployment scope
+// rather than a LeaseManager or one journal object, so independent journals in
+// that scope cannot admit past the configured cap.
 func (j *fileServiceLeaseJournal) StoreIfCapacity(ctx context.Context, leases []*Lease, maximum int) (int, error) {
 	if len(leases) == 0 || maximum <= 0 || len(leases) > maximum {
 		return 0, moerr.NewInternalErrorNoCtx("substrait: invalid lease journal admission")
