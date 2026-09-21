@@ -180,7 +180,7 @@ func TestSiriusCompileFastRejections(t *testing.T) {
 	require.False(t, offloaded)
 
 	require.NoError(t, (*siriusReadOwner)(nil).finish(context.Background(), false))
-	err = (&Compile{}).runSiriusRead(context.Background())
+	err = (&Compile{}).runSiriusRead(context.Background(), nil)
 	require.ErrorContains(t, err, "missing Sirius execution owner")
 }
 
@@ -211,7 +211,7 @@ func TestEmbeddedSiriusAdmissionNeverSilentlyFallsBack(t *testing.T) {
 	for _, query := range []*planpb.Plan{nil, {Plan: &planpb.Plan_Query{Query: &planpb.Query{}}}} {
 		offloaded, err := c.tryCompileSiriusRead(ctx, query)
 		require.False(t, offloaded)
-		require.ErrorContains(t, err, "reader admission is not yet available")
+		require.Error(t, err, "an invalid explicitly embedded query must fail closed")
 		backend.accepting = false
 		offloaded, err = c.tryCompileSiriusRead(ctx, query)
 		require.False(t, offloaded)

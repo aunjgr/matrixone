@@ -45,7 +45,14 @@ type SiriusPrepareRequest struct {
 // Go memory after Push returns. Producers are lazy and owned by the execution.
 type SiriusInput interface {
 	Push(context.Context, uint32, []SiriusInputVector) error
+	IsNotNeeded(error) bool
 }
+
+const (
+	SiriusVectorFlat uint32 = iota
+	SiriusVectorConstant
+	SiriusVectorConstantNull
+)
 
 type SiriusInputVector struct {
 	Class             uint32

@@ -26,6 +26,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile/siriusbridge"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/substrait"
 )
 
 func validateSiriusEmbeddedBuild() error {
@@ -39,11 +40,23 @@ func validateSiriusEmbeddedConfig(c *SiriusConfig) error {
 	if c.InputMode == "" {
 		c.InputMode = "mo"
 	}
-	if c.InputMode != "mo" {
-		return moerr.NewBadConfigNoCtx("embedded Sirius TAE admission is not yet available")
+	if c.InputMode != "mo" && c.InputMode != "tae" {
+		return moerr.NewBadConfigNoCtx("invalid embedded Sirius input mode: expected mo or tae")
 	}
 	if c.BenchmarkNoGC {
-		return moerr.NewBadConfigNoCtx("embedded MO input does not use benchmark-no-gc")
+		return moerr.NewBadConfigNoCtx("embedded Sirius input does not use benchmark-no-gc")
+	}
+	if c.InputMode == "tae" {
+		if c.DataDir == "" {
+			return moerr.NewBadConfigNoCtx("embedded Sirius TAE input requires data-dir")
+		}
+		minimumLeaseTTL := c.RequestTimeout.Duration + c.CleanupTimeout.Duration
+		if c.LeaseTTL.Duration == 0 {
+			c.LeaseTTL.Duration = minimumLeaseTTL
+		}
+		if minimumLeaseTTL <= 0 || c.LeaseTTL.Duration < minimumLeaseTTL || c.LeaseTTL.Duration > substrait.MaxLeaseTTL {
+			return moerr.NewBadConfigNoCtx("invalid embedded Sirius TAE lease TTL")
+		}
 	}
 	if c.GPUStreams == 0 {
 		c.GPUStreams = 2
@@ -98,6 +111,8 @@ func (i embeddedInput) Push(ctx context.Context, rows uint32, vs []compile.Siriu
 	}
 	return i.input.Push(ctx, rows, vectors)
 }
+
+func (i embeddedInput) IsNotNeeded(err error) bool { return i.input.IsNotNeeded(err) }
 
 type embeddedExecution struct {
 	query   *siriusbridge.Query

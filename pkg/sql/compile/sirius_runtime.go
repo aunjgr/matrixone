@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	planpb "github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -32,6 +33,20 @@ import (
 const SiriusRuntimeKey = "sql-compile-sirius-runtime"
 
 type siriusOffloadContextKey struct{}
+
+// SiriusRuntimeSource selects the only read owner a CN runtime may publish.
+// The zero value preserves the existing Flight deployment contract.
+type SiriusRuntimeSource uint8
+
+const (
+	SiriusRuntimeFlight SiriusRuntimeSource = iota
+	SiriusRuntimeEmbeddedMO
+	SiriusRuntimeEmbeddedTAE
+)
+
+func (s SiriusRuntimeSource) embedded() bool {
+	return s == SiriusRuntimeEmbeddedMO || s == SiriusRuntimeEmbeddedTAE
+}
 
 // WithSiriusOffload marks an explicitly hinted statement. Absence of this
 // marker leaves every native compile and execution path unchanged.
@@ -59,8 +74,9 @@ func siriusPlanEligible(queryPlan *planpb.Plan) bool {
 // exception is the explicit local-CN benchmark mode, where TN GC is disabled,
 // and each CN owns one process-local manager and one sidecar pairing.
 type SiriusRuntime struct {
-	// EmbeddedMO has no external resolver or direct-TAE lease dependency.
-	EmbeddedMO               bool
+	// Source is Flight by default. Embedded MO has no lease dependency;
+	// embedded TAE requires the same durable snapshot protection as Flight.
+	Source                   SiriusRuntimeSource
 	Backend                  SiriusBackend
 	Leases                   *substrait.LeaseManager
 	Resolver                 *substrait.ResolverServer
@@ -75,17 +91,28 @@ type SiriusRuntime struct {
 }
 
 func (r *SiriusRuntime) Validate() error {
-	if r != nil && r.EmbeddedMO {
+	if r == nil || r.Backend == nil || r.CleanupTimeout <= 0 {
+		return moerr.NewInternalErrorNoCtx("substrait: incomplete CN Sirius runtime")
+	}
+	if r.Source.embedded() {
 		if r.Backend == nil || r.CleanupTimeout <= 0 {
 			return moerr.NewInternalErrorNoCtx("substrait: incomplete embedded Sirius runtime")
+		}
+		if r.BenchmarkNoGC {
+			return moerr.NewInternalErrorNoCtx("substrait: embedded Sirius cannot use benchmark lease mode")
+		}
+		if r.Source == SiriusRuntimeEmbeddedTAE &&
+			(r.Leases == nil || !r.Leases.DurableReady() || r.DataDir == "" ||
+				r.LeaseTTL <= 0 || r.LeaseTTL > substrait.MaxLeaseTTL) {
+			return moerr.NewInternalErrorNoCtx("substrait: incomplete embedded TAE Sirius runtime")
 		}
 		if health, ok := r.Backend.(interface{ Accepting() bool }); ok && !health.Accepting() {
 			return moerr.NewInvalidStateNoCtx("substrait: embedded Sirius admission is sealed")
 		}
 		return nil
 	}
-	if r == nil || r.Backend == nil || r.Leases == nil ||
-		r.Resolver == nil || len(r.AuthorizedClientSPKIHash) != 32 || r.DataDir == "" ||
+	if r.Source != SiriusRuntimeFlight || r.Leases == nil ||
+		r.Resolver == nil || !nonzeroSiriusSPKI(r.AuthorizedClientSPKIHash) || r.DataDir == "" ||
 		r.LeaseTTL <= 0 || r.LeaseTTL > substrait.MaxLeaseTTL || r.CleanupTimeout <= 0 {
 		return moerr.NewInternalErrorNoCtx("substrait: incomplete CN Sirius runtime")
 	}
@@ -97,6 +124,18 @@ func (r *SiriusRuntime) Validate() error {
 		return moerr.NewInternalErrorNoCtx("substrait: incomplete CN Sirius runtime")
 	}
 	return nil
+}
+
+func nonzeroSiriusSPKI(hash []byte) bool {
+	if len(hash) != 32 {
+		return false
+	}
+	for _, value := range hash {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Close obeys the ownership order: stop/cancel backend work first, then close
@@ -118,17 +157,28 @@ func (r *SiriusRuntime) Close(ctx context.Context) error {
 // ReconcileReplay transfers durable leases left by a prior CN generation to
 // the backend's retry owner. Cancellation by statement identity is idempotent, and
 // lease release starts only after the sidecar acknowledges quiescence.
-func (r *SiriusRuntime) ReconcileReplay() error {
+func (r *SiriusRuntime) ReconcileReplay(ctx context.Context) error {
 	if err := r.Validate(); err != nil {
 		return err
 	}
-	if r.EmbeddedMO {
+	if r.Source == SiriusRuntimeEmbeddedMO {
+		return nil
+	}
+	consumer := substrait.ReadConsumerFlight
+	if r.Source == SiriusRuntimeEmbeddedTAE {
+		consumer = substrait.ReadConsumerEmbeddedTAE
+	}
+	pending, err := r.Leases.ReconcileRestart(ctx, consumer)
+	if err != nil {
+		return err
+	}
+	if r.Source == SiriusRuntimeEmbeddedTAE {
 		return nil
 	}
 	var result error
-	for _, pending := range r.Leases.PendingExecutions() {
-		readRefs := cloneReadRefs(pending.ReadRefs)
-		err := r.Backend.Reconcile(pending.AccountID, pending.QueryID, func(ctx context.Context) error {
+	for _, execution := range pending {
+		readRefs := cloneReadRefs(execution.ReadRefs)
+		err := r.Backend.Reconcile(execution.AccountID, execution.QueryID, func(ctx context.Context) error {
 			return releaseReadRefs(ctx, r.Leases, readRefs)
 		})
 		result = errors.Join(result, err)
@@ -152,10 +202,15 @@ func lookupSiriusRuntime(service string) (*SiriusRuntime, bool) {
 type siriusReadOwner struct {
 	execution SiriusExecution
 	runtime   *SiriusRuntime
+	source    SiriusRuntimeSource
 }
 
 func newSiriusReadOwner(execution SiriusExecution, runtime *SiriusRuntime) *siriusReadOwner {
-	return &siriusReadOwner{execution: execution, runtime: runtime}
+	return &siriusReadOwner{execution: execution, runtime: runtime, source: SiriusRuntimeFlight}
+}
+
+func newSiriusEmbeddedReadOwner(execution SiriusExecution, runtime *SiriusRuntime) *siriusReadOwner {
+	return &siriusReadOwner{execution: execution, runtime: runtime, source: runtime.Source}
 }
 
 func (o *siriusReadOwner) finish(ctx context.Context, succeeded bool) error {
@@ -172,21 +227,28 @@ func (o *siriusReadOwner) finish(ctx context.Context, succeeded bool) error {
 }
 
 func (c *Compile) tryCompileSiriusRead(ctx context.Context, queryPlan *planpb.Plan) (bool, error) {
-	if c == nil || c.proc == nil || !siriusOffloadRequested(ctx) || c.isPrepare || c.isInternal || !siriusStatementEligible(c.stmt) {
+	if c == nil || c.proc == nil || !siriusOffloadRequested(ctx) || c.isPrepare || c.isInternal {
 		return false, nil
 	}
 	runtime, ok := lookupSiriusRuntime(c.proc.GetService())
-	if runtime != nil && runtime.EmbeddedMO {
+	if runtime != nil && runtime.Source.embedded() {
 		// An explicitly selected embedded runtime must not turn failed
 		// admission into an invisible CPU fallback.
 		if err := runtime.Validate(); err != nil {
 			return false, err
 		}
-		// Reader admission/wiring is delivered separately. Do not route an
-		// embedded request through the existing Flight/TAE admission path.
-		return false, moerr.NewNotSupported(ctx, "embedded Sirius MO reader admission is not yet available")
+		if !siriusStatementEligible(c.stmt) {
+			return false, moerr.NewNotSupported(ctx, "embedded Sirius requires an ordinary SELECT statement")
+		}
+		if !siriusPlanEligible(queryPlan) {
+			return false, moerr.NewNotSupported(ctx, "embedded Sirius cannot execute an unresolved index hint")
+		}
+		return c.tryCompileEmbeddedSiriusRead(ctx, queryPlan, runtime)
 	}
 	if !ok {
+		return false, nil
+	}
+	if !siriusStatementEligible(c.stmt) {
 		return false, nil
 	}
 	if !siriusPlanEligible(queryPlan) {
@@ -272,7 +334,10 @@ func releaseReadRefs(ctx context.Context, leases *substrait.LeaseManager, readRe
 	return result
 }
 
-func (c *Compile) runSiriusRead(ctx context.Context) (err error) {
+func (c *Compile) runSiriusRead(
+	ctx context.Context,
+	allocationExporter func(mpool.AllocationAccountTerminalSnapshot),
+) (err error) {
 	owner := c.siriusRead
 	if owner == nil {
 		return moerr.NewInternalError(ctx, "substrait: missing Sirius execution owner")
@@ -282,6 +347,48 @@ func (c *Compile) runSiriusRead(ctx context.Context) (err error) {
 			_ = owner.finish(ctx, false)
 			panic(recovered)
 		}
+	}()
+	if owner.source == SiriusRuntimeEmbeddedMO {
+		return c.runSiriusEmbeddedRead(ctx, owner, allocationExporter)
+	}
+	runErr := owner.execution.Run(ctx, c.proc.Mp(), c.counterSet, c.fill)
+	return errors.Join(runErr, owner.finish(ctx, runErr == nil))
+}
+
+func (c *Compile) runSiriusEmbeddedRead(
+	ctx context.Context,
+	owner *siriusReadOwner,
+	allocationExporter func(mpool.AllocationAccountTerminalSnapshot),
+) (err error) {
+	if c.MessageBoard == nil {
+		return errors.Join(
+			moerr.NewInternalError(ctx, "substrait: embedded Sirius execution has no message board"),
+			owner.finish(ctx, false),
+		)
+	}
+	c.remoteFragmentCounts = collectRemoteFragmentCounts(c.scopes, c.addr)
+	if len(c.remoteFragmentCounts) != 0 {
+		return errors.Join(
+			moerr.NewInternalError(ctx, "substrait: embedded Sirius execution is not local-CN"),
+			owner.finish(ctx, false),
+		)
+	}
+	if err = c.ensureAllocationAccountLifecycle(allocationExporter); err != nil {
+		return errors.Join(err, owner.finish(ctx, false))
+	}
+	attempt, err := c.beginAllocationAccountAttempt()
+	if err != nil {
+		return errors.Join(err, owner.finish(ctx, false))
+	}
+	defer func() {
+		if attempt == nil {
+			return
+		}
+		_, finishErr := attempt.finish()
+		if c.allocationAttempt == attempt {
+			c.allocationAttempt = nil
+		}
+		err = errors.Join(err, finishErr)
 	}()
 	runErr := owner.execution.Run(ctx, c.proc.Mp(), c.counterSet, c.fill)
 	return errors.Join(runErr, owner.finish(ctx, runErr == nil))

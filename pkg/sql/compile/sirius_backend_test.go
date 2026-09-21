@@ -119,12 +119,12 @@ func TestSiriusBackendExecutionUsesCompilerCleanup(t *testing.T) {
 				siriusRead: newSiriusReadOwner(execution, &SiriusRuntime{CleanupTimeout: time.Second}),
 			}
 			if name == "consumer panic" {
-				require.PanicsWithValue(t, consumerErr, func() { _ = c.runSiriusRead(ctx) })
+				require.PanicsWithValue(t, consumerErr, func() { _ = c.runSiriusRead(ctx, nil) })
 				require.Equal(t, 1, cleanups)
 				require.Equal(t, 1, fills)
 				return
 			}
-			err := c.runSiriusRead(ctx)
+			err := c.runSiriusRead(ctx, nil)
 			require.Equal(t, 1, cleanups)
 			if name == "canceled request" {
 				require.Zero(t, fills)

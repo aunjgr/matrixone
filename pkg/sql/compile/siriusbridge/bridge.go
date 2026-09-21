@@ -226,6 +226,11 @@ func vectorPayloadBytes(vectors []Vector) (uint64, error) {
 	return total, nil
 }
 
+// IsNotNeeded identifies the successful early-retirement signal for this
+// input. Keeping the check on Input avoids leaking bridge-private errors into
+// compiler-owned producer pipelines.
+func (*Input) IsNotNeeded(err error) bool { return IsNotNeeded(err) }
+
 type Runtime struct {
 	mu             sync.Mutex
 	native         driver

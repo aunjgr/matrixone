@@ -156,6 +156,30 @@ func TestOutputCallbackCPUIsNotOutputWait(t *testing.T) {
 	require.Zero(t, proc.Mp().CurrNB())
 }
 
+func TestOutputShouldStopOnlyAfterSuccessfulCallback(t *testing.T) {
+	proc := testutil.NewProcessWithMPool(t, "", mpool.MustNewZero())
+	t.Cleanup(proc.Free)
+	stop := false
+	calls := 0
+	arg := NewArgument().
+		WithFunc(func(_ *batch.Batch, _ *perfcounter.CounterSet) error {
+			calls++
+			stop = true
+			return nil
+		}).
+		WithShouldStop(func() bool { return stop })
+	t.Cleanup(arg.Release)
+	arg.AppendChild(colexec.NewMockOperator().WithBatchs([]*batch.Batch{
+		newBatch([]types.Type{types.T_int8.ToType()}, proc, 1),
+	}))
+	require.NoError(t, arg.Prepare(proc))
+	result, err := arg.Call(proc)
+	require.NoError(t, err)
+	require.Equal(t, vm.ExecStop, result.Status)
+	require.Equal(t, 1, calls)
+	arg.GetChildren(0).Free(proc, false, nil)
+}
+
 // create a new block based on the type information
 func newBatch(ts []types.Type, proc *process.Process, rows int64) *batch.Batch {
 	return testutil.NewBatch(ts, false, int(rows), proc.Mp())
