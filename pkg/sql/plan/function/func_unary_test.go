@@ -6657,11 +6657,11 @@ func TestHexNumericTypeResolution(t *testing.T) {
 		castType   types.T
 	}{
 		{name: "bool", typ: types.T_bool.ToType(), overloadID: 2, cast: true, castType: types.T_int64},
-		{name: "decimal64", typ: types.New(types.T_decimal64, 18, 1), overloadID: 8},
-		{name: "decimal128", typ: types.New(types.T_decimal128, 38, 0), overloadID: 9},
-		{name: "decimal256", typ: types.New(types.T_decimal256, 65, 0), overloadID: 10},
-		{name: "float32", typ: types.T_float32.ToType(), overloadID: HexFloat32Overload},
-		{name: "float64", typ: types.T_float64.ToType(), overloadID: HexFloat64Overload},
+		{name: "decimal64", typ: types.New(types.T_decimal64, 18, 1), overloadID: 2, cast: true, castType: types.T_int64},
+		{name: "decimal128", typ: types.New(types.T_decimal128, 38, 0), overloadID: 2, cast: true, castType: types.T_int64},
+		{name: "decimal256", typ: types.New(types.T_decimal256, 65, 0), overloadID: 2, cast: true, castType: types.T_int64},
+		{name: "float32", typ: types.T_float32.ToType(), overloadID: 2, cast: true, castType: types.T_int64},
+		{name: "float64", typ: types.T_float64.ToType(), overloadID: 2, cast: true, castType: types.T_int64},
 		{name: "varchar", typ: types.T_varchar.ToType(), overloadID: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -6800,7 +6800,7 @@ func TestHexExplicitFloatRejectsSignedIntegerOverflow(t *testing.T) {
 	require.True(t, ok, info)
 }
 
-func TestHexDecimalRegistrationExecutesExactly(t *testing.T) {
+func TestHexLegacyDecimalRegistrationExecutesExactly(t *testing.T) {
 	proc := testutil.NewProcess(t)
 
 	decimal64Strings := []string{"15.5", "-15.5", "14.5", "-14.5", "0.0"}
@@ -6853,13 +6853,13 @@ func TestHexDecimalRegistrationExecutesExactly(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resolved, err := GetFunctionByName(proc.Ctx, "hex", []types.Type{tc.typ})
+			identity := EncodeOverloadID(HEX, tc.overloadID)
+			_, err := GetFunctionById(proc.Ctx, identity)
 			require.NoError(t, err)
-			require.Equal(t, tc.overloadID, resolved.overloadId)
 			input := newVectorByType(proc.Mp(), tc.typ, tc.values, nil)
 			defer input.Free(proc.Mp())
 			input.GetNulls().Add(uint64(len(tc.want) - 1))
-			out, err := RunFunctionDirectly(proc, resolved.GetEncodedOverloadID(), []*vector.Vector{input}, len(tc.want))
+			out, err := RunFunctionDirectly(proc, identity, []*vector.Vector{input}, len(tc.want))
 			require.NoError(t, err)
 			defer out.Free(proc.Mp())
 			for i, want := range tc.want {
@@ -7483,6 +7483,50 @@ func TestVecFromBase64Narrow(t *testing.T) {
 	ok, info = runCase(mkInput("AQID"),
 		NewFunctionTestResult(types.T_array_bf16.ToType(), true, [][]types.BF16{nil}, []bool{}), VecFromBase64[types.BF16])
 	require.Truef(t, ok, "odd length should error: %s", info)
+}
+
+func TestVecFromBase64InvalidInputClass(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	checkError := func(t *testing.T, resultType types.Type, decode fEvalFn, input string) error {
+		t.Helper()
+		fc := NewFunctionTestCase(proc,
+			[]FunctionTestInput{NewFunctionTestInput(types.T_varchar.ToType(), []string{input}, nil)},
+			NewFunctionTestResult(resultType, true, nil, nil), decode)
+		defer func() {
+			for _, parameter := range fc.parameters {
+				parameter.Free(proc.Mp())
+			}
+			fc.result.GetResultVector().Free(proc.Mp())
+		}()
+		require.NoError(t, fc.result.PreExtendAndReset(fc.fnLength))
+		_, err := fc.DebugRun()
+		return err
+	}
+	cases := []struct {
+		name       string
+		resultType types.Type
+		decode     fEvalFn
+		width      int
+	}{
+		{"f32", types.T_array_float32.ToType(), VecFromBase64[float32], 4},
+		{"f64", types.T_array_float64.ToType(), VecFromBase64[float64], 8},
+		{"f16", types.T_array_float16.ToType(), VecFromBase64[types.Float16], 2},
+		{"bf16", types.T_array_bf16.ToType(), VecFromBase64[types.BF16], 2},
+		{"int8", types.T_array_int8.ToType(), VecFromBase64[int8], 1},
+		{"uint8", types.T_array_uint8.ToType(), VecFromBase64[uint8], 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkError(t, tc.resultType, tc.decode, "!!!")
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), "malformed base64: %v", err)
+
+			if tc.width > 1 {
+				err = checkError(t, tc.resultType, tc.decode, "AA==")
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), "unaligned decoded length: %v", err)
+				require.ErrorContains(t, err, "not a multiple")
+			}
+		})
+	}
 }
 
 func initValidatePasswordStrengthTestCase() []tcTemp {

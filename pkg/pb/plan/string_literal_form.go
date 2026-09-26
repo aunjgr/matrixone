@@ -363,6 +363,11 @@ const (
 // SpatialDistanceSemantics requires MORPC v90 because geodetic
 // ST_FRECHETDISTANCE/ST_HAUSDORFFDISTANCE change the meaning of existing
 // overloads and the distance family adds length-unit overloads.
+// PreparedPrecisionScalar requires MORPC v95 because older executors lose
+// scalar identity when CEIL/FLOOR precision passes through private CAST 5/6.
+// DecimalDivisionSemantics requires MORPC v97 for new plans because older
+// executors derive the quotient scale from the left operand instead of the
+// result type. Legacy plans remain executable by v97 receivers.
 type RemoteExpressionFeatures struct {
 	NumericPrefix                   bool
 	JSONComparisonParam             bool
@@ -382,6 +387,8 @@ type RemoteExpressionFeatures struct {
 	ExpressionResultMetadataContracts bool
 	DecimalLiteralSemantics           bool
 	SpatialDistanceSemantics          bool
+	PreparedPrecisionScalar           bool
+	DecimalDivisionSemantics          bool
 }
 
 func (features RemoteExpressionFeatures) Any() bool {
@@ -401,7 +408,31 @@ func (features RemoteExpressionFeatures) Any() bool {
 		features.IPFunctionResultContracts ||
 		features.ExpressionResultMetadataContracts ||
 		features.DecimalLiteralSemantics ||
-		features.SpatialDistanceSemantics
+		features.SpatialDistanceSemantics ||
+		features.PreparedPrecisionScalar ||
+		features.DecimalDivisionSemantics
+}
+
+func hasPrivateIntegerPrecisionCast(expr *Expr) bool {
+	if expr == nil {
+		return false
+	}
+	fn := expr.GetF()
+	if fn == nil || fn.Func == nil {
+		return false
+	}
+	if int32(fn.Func.Obj>>32) == 21 {
+		overload := int32(fn.Func.Obj)
+		if overload == 5 || overload == 6 {
+			return true
+		}
+	}
+	for _, arg := range fn.Args {
+		if hasPrivateIntegerPrecisionCast(arg) {
+			return true
+		}
+	}
+	return false
 }
 
 func isBoundedConditionalStringDomain(fn *Function) bool {
@@ -810,6 +841,16 @@ func RequiredRemoteExpressionFeatures(owner any) (features RemoteExpressionFeatu
 			fn := current.GetF()
 			if fn != nil && fn.Func != nil {
 				id, overload := int32(fn.Func.Obj>>32), int32(fn.Func.Obj)
+				// DIV overload 0 keeps its function identity, but v97 changes
+				// decimal result scale and coefficient interpretation.
+				if id == 13 && overload == 0 &&
+					(current.Typ.Id == 32 || current.Typ.Id == 33 || current.Typ.Id == 34) {
+					features.DecimalDivisionSemantics = true
+				}
+				if (id == 72 || id == 103) && len(fn.Args) == 2 &&
+					hasPrivateIntegerPrecisionCast(fn.Args[1]) {
+					features.PreparedPrecisionScalar = true
+				}
 				// CAST is stable function ID 21. Match execution identity, not
 				// names or source types; legacy CAST 0..4 remains executable.
 				if id == 21 && overload >= 5 && overload <= 8 {

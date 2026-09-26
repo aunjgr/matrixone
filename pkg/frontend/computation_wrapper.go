@@ -421,10 +421,17 @@ func (cwft *TxnComputationWrapper) Compile(any any, fill func(*batch.Batch, *per
 			return nil, err
 		}
 		if preparedExprRetry != nil {
+			bindingCtx := function.WithNoUnsignedSubtraction(
+				execCtx.reqCtx, mysql.HasSQLMode(sessionSQLMode(cwft.ses), "NO_UNSIGNED_SUBTRACTION"))
+			bindingCtx = function.WithDivPrecisionIncrement(
+				bindingCtx, sessionDivPrecisionIncrement(cwft.ses))
 			runtimePlan, _, specializationErr := plan2.FillValuesOfParamsInPlanWithSpecialization(
-				function.WithNoUnsignedSubtraction(execCtx.reqCtx, mysql.HasSQLMode(sessionSQLMode(cwft.ses), "NO_UNSIGNED_SUBTRACTION")), cwft.plan, preparedExprRetry.paramVals)
+				bindingCtx, cwft.plan, preparedExprRetry.paramVals)
 			if specializationErr != nil {
 				return nil, specializationErr
+			}
+			if err = plan2.RefreshPreparedCTASInferredColumns(execCtx.reqCtx, runtimePlan, cwft.plan, cwft.stmt); err != nil {
+				return nil, err
 			}
 			cwft.plan = runtimePlan
 		}
@@ -547,6 +554,8 @@ func (cwft *TxnComputationWrapper) Compile(any any, fill func(*batch.Batch, *per
 			cwft.ses.SetData(nil)
 		case *tree.SetVar, *tree.ShowVariables, *tree.ShowErrors, *tree.ShowWarnings,
 			*tree.CreateAccount, *tree.AlterAccount, *tree.DropAccount, *tree.AnalyzeStmt,
+			*tree.CreatePublication, *tree.AlterPublication, *tree.DropPublication,
+			*tree.ShowPublications, *tree.ShowPublicationCoverage,
 			*tree.DataBranchCreateTable, *tree.DataBranchCreateDatabase,
 			*tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick,
 			*tree.DataBranchDeleteTable, *tree.DataBranchDeleteDatabase:
@@ -625,6 +634,9 @@ func (cwft *TxnComputationWrapper) Compile(any any, fill func(*batch.Batch, *per
 				cwft.ses.GetSql(),
 			); err != nil {
 				return nil, err
+			}
+			if preparedCTASNeedsSemanticParams(cwft.stmt) {
+				retComp.SetPreparedParamValues(cwft.paramVals)
 			}
 			cwft.compile = retComp
 		}
@@ -1420,7 +1432,9 @@ func initExecuteStmtParamWithResolverInSession(
 	currentOnlyFullGroupBy := owner.sqlModeHasOnlyFullGroupBy()
 	currentBoolSumAvg := owner.sqlModeHasEnableBoolSumAvg()
 	currentNoUnsignedSubtraction := owner.sqlModeHasNoUnsignedSubtraction()
+	currentDivPrecisionIncrement := owner.currentDivPrecisionIncrement()
 	reqCtx = function.WithNoUnsignedSubtraction(reqCtx, currentNoUnsignedSubtraction)
+	reqCtx = function.WithDivPrecisionIncrement(reqCtx, int32(currentDivPrecisionIncrement))
 
 	// TODO check if schema change, obj.Obj is zero all the time in 0.6
 	eng := cwft.proc.Base.SessionInfo.StorageEngine
@@ -1469,7 +1483,9 @@ func initExecuteStmtParamWithResolverInSession(
 	modeMismatch := prepareStmt.NativeMode != currentNativeMode ||
 		prepareStmt.sqlModeFlagsSet && (prepareStmt.OnlyFullGroupBy != currentOnlyFullGroupBy ||
 			prepareStmt.BoolSumAvg != currentBoolSumAvg ||
-			prepareStmt.NoUnsignedSubtraction != currentNoUnsignedSubtraction)
+			prepareStmt.NoUnsignedSubtraction != currentNoUnsignedSubtraction) ||
+		prepareStmt.divPrecisionIncrementSet &&
+			prepareStmt.divPrecisionIncrement != currentDivPrecisionIncrement
 	protocolVersion := currentProtocolVersion(cwft.proc)
 	protocolMismatch := prepareStmt.protocolVersion != 0 &&
 		prepareStmt.protocolVersion != protocolVersion
@@ -1533,6 +1549,7 @@ func initExecuteStmtParamWithResolverInSession(
 			newPreparePlan.Plan, len(newPreparePlan.ParamTypes))
 		prepareStmt.numericOverloadParamPositions = plan2.PreparedPlanNumericFallbackParamPositions(
 			newPreparePlan.Plan)
+		prepareStmt.refreshGenerateSeriesParamMetadata(newPreparePlan.Plan)
 		prepareStmt.bitCountOverloadParamPositions = plan2.PreparedPlanBitCountFallbackParamPositions(
 			newPreparePlan.Plan)
 		prepareStmt.conversionParamPositions = plan2.PreparedPlanConversionParamPositions(
@@ -1557,7 +1574,9 @@ func initExecuteStmtParamWithResolverInSession(
 		prepareStmt.OnlyFullGroupBy = currentOnlyFullGroupBy
 		prepareStmt.BoolSumAvg = currentBoolSumAvg
 		prepareStmt.NoUnsignedSubtraction = currentNoUnsignedSubtraction
+		prepareStmt.divPrecisionIncrement = currentDivPrecisionIncrement
 		prepareStmt.sqlModeFlagsSet = true
+		prepareStmt.divPrecisionIncrementSet = true
 		prepareStmt.Ts = prepareTs
 		prepareStmt.tempTableVersion = currentTempTableVersion
 		prepareStmt.ddlVersion = currentDDLVersion
@@ -1814,7 +1833,7 @@ func initExecuteStmtParamWithResolverInSession(
 			cwft.paramVals, err = preparedParamValues(
 				cwft.proc, prepareStmt.ParamTypes,
 				prepareStmt.inetNtoaParamPositions,
-				prepareStmt.numericOverloadParamPositions)
+				prepareStmt.temporalRuntimeParamPositions)
 			if err != nil {
 				return nil, nil, nil, originSQL, false, err
 			}
@@ -1948,7 +1967,8 @@ func initExecuteStmtParamWithResolverInSession(
 	// cannot be read or installed, so leave its bounded previous category dormant
 	// instead of scanning an ordinary prepared DML on every EXECUTE.
 	runtimeCacheEligible := !runtimeSpecializationCandidate ||
-		(shouldCachePreparedRuntimeSpecialization(preparePlan.Plan) &&
+		(!prepareStmt.parameterizedGenerateSeries &&
+			shouldCachePreparedRuntimeSpecialization(preparePlan.Plan) &&
 			shouldCachePreparedRuntimeSpecialization(executionPlan))
 	if !runtimeCacheEligible {
 		prepareStmt.clearRuntimeSpecializationCache()
@@ -1997,6 +2017,9 @@ func initExecuteStmtParamWithResolverInSession(
 		return nil, nil, nil, originSQL, false, err
 	}
 	if runtimePlanApplied {
+		if err = plan2.RefreshPreparedCTASInferredColumns(reqCtx, runtimePlan, executionPlan, prepareStmt.PrepareStmt); err != nil {
+			return nil, nil, nil, originSQL, false, err
+		}
 		executionPlan = runtimePlan
 		if binaryExecute {
 			columns := getPreparedResultColumnsForWithGroupConcatMaxLen(
@@ -3275,6 +3298,14 @@ func shouldCachePreparedRuntimeSpecialization(p *plan.Plan) bool {
 	return !plan2.PreparedPlanHasPercentileParams(p)
 }
 
+func (prepareStmt *PrepareStmt) refreshGenerateSeriesParamMetadata(p *plan.Plan) {
+	endpoints, parameterized := plan2.PreparedPlanGenerateSeriesParameterInfo(p)
+	prepareStmt.parameterizedGenerateSeries = parameterized
+	positions := slices.Concat(prepareStmt.numericOverloadParamPositions, endpoints)
+	slices.Sort(positions)
+	prepareStmt.temporalRuntimeParamPositions = slices.Compact(positions)
+}
+
 func shouldRebuildPreparePlan(schemaChanged bool, p *plan.Plan) bool {
 	if schemaChanged || p == nil {
 		return schemaChanged
@@ -3283,6 +3314,11 @@ func shouldRebuildPreparePlan(schemaChanged bool, p *plan.Plan) bool {
 	return query != nil && (query.GetHasForeignKeyAction() ||
 		plan2.PreparedPlanDependsOnSubscriptionMetadata(p) ||
 		plan2.PreparedPlanDependsOnIndexCoverage(p))
+}
+
+func preparedCTASNeedsSemanticParams(stmt tree.Statement) bool {
+	ctas, ok := stmt.(*tree.CreateTable)
+	return ok && ctas.IsAsSelect
 }
 
 func createCompile(
@@ -3370,6 +3406,9 @@ func createCompile(
 		getStatementStartAt(execCtx.reqCtx),
 	)
 	retCompile.SetIsPrepare(isPrepare)
+	if preparedRetry != nil && preparedCTASNeedsSemanticParams(stmt) {
+		retCompile.SetPreparedParamValues(preparedRetry.paramVals)
+	}
 	retCompile.SetGroupConcatMaxLenFloor(groupConcatMaxLenFloor)
 	if schedulingSQLMode != nil {
 		retCompile.SetQuerySchedulingIntent(querySchedulingIntentForStatementWithSQLMode(
@@ -3447,6 +3486,7 @@ func buildPlanForCompileRetry(
 ) (*plan2.Plan, error) {
 	if ses != nil {
 		ctx = function.WithNoUnsignedSubtraction(ctx, mysql.HasSQLMode(sessionSQLMode(ses), "NO_UNSIGNED_SUBTRACTION"))
+		ctx = function.WithDivPrecisionIncrement(ctx, sessionDivPrecisionIncrement(ses))
 	}
 	// No permission verification is required when retry execute buildPlan.
 	retryPlan, err := buildPlanWithPrepareMode(
@@ -3469,7 +3509,10 @@ func buildPlanForCompileRetry(
 	if forcePrepare {
 		runtimePlan, _, err := plan2.FillValuesOfParamsInPlanWithSpecialization(
 			ctx, retryPlan, preparedRetry.paramVals)
-		return runtimePlan, err
+		if err != nil {
+			return nil, err
+		}
+		return runtimePlan, plan2.RefreshPreparedCTASInferredColumns(ctx, runtimePlan, retryPlan, stmt)
 	}
 	runtimePlan, _, applied, err := specializePreparedExecutionPlan(
 		ctx, retryPlan, preparedRetry.paramVals, preparedRetry.binaryExecute,
@@ -3479,7 +3522,7 @@ func buildPlanForCompileRetry(
 		return nil, err
 	}
 	if applied {
-		return runtimePlan, nil
+		return runtimePlan, plan2.RefreshPreparedCTASInferredColumns(ctx, runtimePlan, retryPlan, stmt)
 	}
 	return retryPlan, nil
 }

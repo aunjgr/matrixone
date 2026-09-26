@@ -3128,6 +3128,126 @@ func (b *baseBinder) hasPreparedNumericParamExprs(exprs []tree.Expr, depth int32
 	return false, nil
 }
 
+// HAVING and SELECT bind before their aggregate/window nodes are appended.
+// Resolve those output tags from the current binding context during that phase.
+func (b *baseBinder) pendingColumnSource(col *plan.ColRef) *Expr {
+	if b.ctx == nil || col == nil || col.ColPos < 0 {
+		return nil
+	}
+	var outputs []*Expr
+	switch col.RelPos {
+	case b.ctx.groupTag:
+		outputs = b.ctx.groups
+	case b.ctx.aggregateTag:
+		outputs = b.ctx.aggregates
+	case b.ctx.windowTag:
+		outputs = b.ctx.windows
+	}
+	if int(col.ColPos) >= len(outputs) {
+		return nil
+	}
+	source := outputs[col.ColPos]
+	if window := source.GetW(); window != nil {
+		return window.WindowFunc
+	}
+	return source
+}
+
+// A derived column can hide its marker behind a ColRef before the enclosing
+// function is bound. Follow only that column's projection, not unrelated
+// predicates or siblings, when deciding which numeric peers are provisional.
+func (b *baseBinder) preparedExprContainsProjectedParam(expr *Expr) bool {
+	if preparedExprContainsParam(expr) {
+		return true
+	}
+	if expr == nil || b.builder == nil || b.builder.qry == nil {
+		return false
+	}
+	var visited map[[3]int32]struct{}
+	var contains func(*Expr) bool
+	var output func(int32, int32, int32) bool
+	output = func(nodeID, tag, pos int32) bool {
+		if nodeID < 0 || int(nodeID) >= len(b.builder.qry.Nodes) || pos < 0 {
+			return false
+		}
+		if visited == nil {
+			visited = make(map[[3]int32]struct{})
+		}
+		key := [3]int32{nodeID, tag, pos}
+		if _, seen := visited[key]; seen {
+			return false
+		}
+		visited[key] = struct{}{}
+		node := b.builder.qry.Nodes[nodeID]
+		if node == nil {
+			return false
+		}
+		switch node.NodeType {
+		case plan.Node_AGG:
+			if len(node.BindingTags) > 0 && tag == node.BindingTags[0] && int(pos) < len(node.GroupBy) {
+				return contains(node.GroupBy[pos])
+			}
+			if len(node.BindingTags) > 1 && tag == node.BindingTags[1] && int(pos) < len(node.AggList) {
+				return contains(node.AggList[pos])
+			}
+		case plan.Node_WINDOW:
+			if node.WindowIdx == pos && len(node.WinSpecList) > 0 {
+				return contains(node.WinSpecList[0].GetW().GetWindowFunc())
+			}
+			// All windows in a query block share a tag; its map entry is the last window.
+			if len(node.Children) == 1 {
+				return output(node.Children[0], tag, pos)
+			}
+		case plan.Node_PARTITION:
+			if len(node.Children) == 1 {
+				return output(node.Children[0], tag, pos)
+			}
+		}
+		if isPreparedSetOperationNode(node.NodeType) {
+			for _, childID := range node.Children {
+				if childID >= 0 && int(childID) < len(b.builder.qry.Nodes) {
+					child := b.builder.qry.Nodes[childID]
+					if child != nil && int(pos) < len(child.ProjectList) && contains(child.ProjectList[pos]) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		return int(pos) < len(node.ProjectList) && contains(node.ProjectList[pos])
+	}
+	contains = func(source *Expr) bool {
+		if source == nil {
+			return false
+		}
+		if sub := source.GetSub(); sub != nil && sub.Typ == plan.SubqueryRef_SCALAR {
+			// Only the selected scalar output can own this value. Predicates and
+			// other internal columns are dependencies of the subquery's rows, not
+			// of its result domain.
+			return output(sub.NodeId, -1, 0)
+		}
+		if preparedExprContainsParam(source) {
+			return true
+		}
+		found := false
+		_ = plan.VisitExprTree(source, func(nested *Expr) error {
+			if sub := nested.GetSub(); !found && sub != nil && sub.Typ == plan.SubqueryRef_SCALAR {
+				found = output(sub.NodeId, -1, 0)
+			}
+			if col := nested.GetCol(); !found && col != nil {
+				if nodeID, ok := b.builder.tag2NodeID[col.RelPos]; ok {
+					found = output(nodeID, col.RelPos, col.ColPos)
+				} else if pending := b.pendingColumnSource(col); pending != nil {
+					found = contains(pending)
+				}
+			}
+			return nil
+		})
+		return found
+	}
+	return contains(expr)
+}
+
 func isPreparedNumericAggregate(name string, argCount int) bool {
 	return argCount == 1 && (strings.EqualFold(name, "sum") || strings.EqualFold(name, "avg"))
 }
@@ -3432,9 +3552,9 @@ func containsExplicitFloatCastInSelect(stmt tree.SelectStatement) bool {
 
 // bindPreparedNumericFuncExpr gives prepared numeric function arguments the
 // same static context as prepared arithmetic. SUM/AVG use the inferred numeric
-// domain, NTILE requires an integer domain, CHAR uses an integer domain only
-// for arguments that contain a prepared marker. ParamRef remains TEXT for
-// transport and an explicit cast materializes the computation type.
+// domain and NTILE requires an integer domain. Parameter-owned integer roles
+// instead preserve their source domain through the shared binding path.
+// ParamRef remains TEXT for transport.
 // Non-parameter expressions stay on their original binding path, so ordinary
 // string inputs continue to use their function-specific string semantics.
 func (b *baseBinder) bindPreparedNumericFuncExpr(
@@ -3446,26 +3566,17 @@ func (b *baseBinder) bindPreparedNumericFuncExpr(
 	if b.builder == nil || !b.builder.isPrepareStatement || !ok {
 		return b.bindFuncExprImplByAstExpr(name, astArgs, depth)
 	}
-	if strings.EqualFold(name, "char") {
-		args := make([]*plan.Expr, len(astArgs))
-		for i, astArg := range astArgs {
-			hasPreparedParam, err := b.hasPreparedNumericParamExprs([]tree.Expr{astArg}, depth)
-			if err != nil {
-				return nil, err
-			}
-			if hasPreparedParam {
-				args[i], err = b.bindNumericExprWithContext(astArg, depth, target)
-			} else {
-				args[i], err = b.impl.BindExpr(astArg, depth, false)
-			}
-			if err != nil {
-				return nil, err
-			}
+	if function.IntegerArgumentSourceDependent(name, 0) {
+		return b.bindFuncExprImplByAstExpr(name, astArgs, depth)
+	}
+	if isPreparedNumericAggregate(name, len(astArgs)) {
+		hasParam, err := b.hasPreparedNumericParamExprs(astArgs, depth)
+		if err != nil {
+			return nil, err
 		}
-		return bindBoundFuncExprAndConstFoldWithObserver(
-			b.GetContext(), b.builder.compCtx.GetProcess(), name, args,
-			b.observePersistedExpressionProtocol,
-		)
+		if !hasParam {
+			return b.bindFuncExprImplByAstExpr(name, astArgs, depth)
+		}
 	}
 
 	// Binding can normalize the parsed CAST node in place. Snapshot the user's
@@ -3476,6 +3587,14 @@ func (b *baseBinder) bindPreparedNumericFuncExpr(
 	arg, err := b.bindNumericExprWithContext(astArgs[0], depth, target)
 	if err != nil {
 		return nil, err
+	}
+	if isPreparedNumericAggregate(name, len(astArgs)) {
+		rewritten, err := b.useStoredMySQLSpecialTypesForNumericContractWithProvenance(
+			b.GetContext(), name, []*plan.Expr{arg})
+		if err != nil {
+			return nil, err
+		}
+		arg = rewritten[0]
 	}
 	if (strings.EqualFold(name, "abs") && !hasExplicitFloatCast) ||
 		(strings.EqualFold(name, "sign") && !hasExplicitNumericCast) {
@@ -3774,6 +3893,21 @@ func (b *baseBinder) bindFuncExprImplByAstExpr(name string, astArgs []tree.Expr,
 				b.numericParamType = nil
 				b.numericSubqueryTarget = nil
 				expr, err = b.bindIntegerArgumentAst(arg, depth, target)
+			} else if function.IntegerArgumentSourceDependent(name, idx) {
+				b.numericParamType = nil
+				b.numericSubqueryTarget = nil
+				if function.IntegerArgumentUsesBitSources(name, idx) {
+					expr, err = b.bindIntegerSourceAst(arg, depth, types.T_int64, name, idx)
+				} else {
+					// A numeric-only role retains ordinary string/array selectors.
+					previous := b.integerArgumentSourceContext
+					b.integerArgumentSourceContext = true
+					expr, err = b.impl.BindExpr(arg, depth, false)
+					b.integerArgumentSourceContext = previous
+					if err == nil {
+						expr, err = b.integerArgumentStorageSource(expr)
+					}
+				}
 			} else {
 				expr, err = b.impl.BindExpr(arg, depth, false)
 			}
@@ -3783,6 +3917,20 @@ func (b *baseBinder) bindFuncExprImplByAstExpr(name string, astArgs []tree.Expr,
 			b.numericSubqueryTarget = subqueryTarget
 			if err != nil {
 				return nil, err
+			}
+			if b.builder != nil && b.builder.isPrepareStatement && len(astArgs) == 1 && idx == 0 &&
+				(name == "hll_cardinality" || name == "hll_merge_agg" || name == "bitmap_or_agg") {
+				if _, directParam := unwrapParenExpr(arg).(*tree.ParamExpr); directParam {
+					binaryType := types.T_varbinary.ToType()
+					// Opaque aggregate states can exceed the SQL VARBINARY(65535)
+					// width. This internal cast chooses the binary domain without
+					// imposing a value-length limit on the prepared parameter.
+					binaryType.Width = 0
+					expr, err = appendCastBeforeExpr(b.GetContext(), expr, makePlan2Type(&binaryType))
+					if err != nil {
+						return nil, err
+					}
+				}
 			}
 			if b.builder != nil && b.builder.isPrepareStatement && name == "bit_count" &&
 				len(astArgs) == 1 {
@@ -3803,15 +3951,15 @@ func (b *baseBinder) bindFuncExprImplByAstExpr(name string, astArgs []tree.Expr,
 	preparedNumericProvenance := false
 	if b.builder != nil && b.builder.isPrepareStatement &&
 		(isNumericContextFunction(name) || supportsGenericNumericFunctionContext(name) ||
-			preparedSQLExecuteNumericResultConsumer(name) || name == "iff") {
+			preparedSQLExecuteNumericResultConsumer(name) || name == "iff" || name == "field") {
 		var err error
 		preparedNumericProvenance, err = b.hasPreparedNumericParamExprs(astArgs, depth)
 		if err != nil {
 			return nil, err
 		}
-		if !preparedNumericProvenance && (preparedSQLExecuteNumericResultConsumer(name) || name == "iff") {
+		if !preparedNumericProvenance && (preparedSQLExecuteNumericResultConsumer(name) || name == "iff" || name == "field") {
 			for _, arg := range args {
-				if preparedExprContainsParam(arg) {
+				if b.preparedExprContainsProjectedParam(arg) {
 					preparedNumericProvenance = true
 					break
 				}
@@ -3829,7 +3977,7 @@ func (b *baseBinder) bindFuncExprImplByAstExpr(name string, astArgs []tree.Expr,
 	preparedPeerSources := make([]*plan.Expr, len(args))
 	if preparedNumericProvenance {
 		for i, arg := range args {
-			if arg == nil || preparedExprContainsParam(arg) {
+			if arg == nil || b.preparedExprContainsProjectedParam(arg) {
 				continue
 			}
 			source := arg
@@ -4010,8 +4158,9 @@ func (b *baseBinder) bindFuncExprImplByAstExpr(name string, astArgs []tree.Expr,
 			}
 			if isIfNull {
 				e.Typ.NotNullable = args[1].Typ.NotNullable || args[2].Typ.NotNullable
+				ensurePreparedNumericMetadata(e).IfnullCommonValue = true
 			}
-			markPreparedResultCastsProvisional(
+			b.markPreparedResultCastsProvisional(
 				b.GetContext(), name, astArgs, preparedPeerSources, e, preparedNumericProvenance)
 			return e, nil
 		}
@@ -4033,6 +4182,7 @@ func (b *baseBinder) bindFuncExprImplByAstExpr(name string, astArgs []tree.Expr,
 		if err == nil {
 			if isIfNull {
 				builtinExpr.Typ.NotNullable = args[1].Typ.NotNullable || args[2].Typ.NotNullable
+				ensurePreparedNumericMetadata(builtinExpr).IfnullCommonValue = true
 			}
 			return builtinExpr, nil
 		}
@@ -4149,7 +4299,7 @@ func avgIntegerConstantPrecision(astExpr tree.Expr) (int32, bool) {
 	}
 }
 
-func markPreparedResultCastsProvisional(
+func (b *baseBinder) markPreparedResultCastsProvisional(
 	ctx context.Context,
 	name string,
 	astArgs []tree.Expr,
@@ -4186,7 +4336,7 @@ func markPreparedResultCastsProvisional(
 				}
 			}
 		}
-		if i >= len(astArgs) || !preparedSQLExecuteNumericResultValueArg(name, i, len(args)) {
+		if i >= len(astArgs) || (name != "field" && !preparedSQLExecuteNumericResultValueArg(name, i, len(args))) {
 			continue
 		}
 		if _, explicit := unwrapParenExpr(astArgs[i]).(*tree.CastExpr); explicit {
@@ -4194,7 +4344,14 @@ func markPreparedResultCastsProvisional(
 		}
 		fn := arg.GetF()
 		if fn == nil || fn.Func == nil || !strings.EqualFold(fn.Func.GetObjName(), "cast") ||
-			len(fn.Args) == 0 || !preparedExprContainsParam(fn.Args[0]) {
+			len(fn.Args) == 0 || !b.preparedExprContainsProjectedParam(fn.Args[0]) {
+			continue
+		}
+		if b.builder != nil && b.builder.boolSumAvgCompat &&
+			(strings.EqualFold(name, "sum") || strings.EqualFold(name, "avg")) &&
+			types.T(arg.Typ.Id) == types.T_int8 && types.T(fn.Args[0].Typ.Id) == types.T_bool {
+			// This is SUM/AVG's mode-authorized BOOL adapter, not a temporary
+			// cast chosen for the marker's unresolved PREPARE-time domain.
 			continue
 		}
 		// This cast was introduced while the marker still had its prepare-time
@@ -5137,15 +5294,28 @@ func (b *baseBinder) annotateStringDomainSource(
 		if b.builder == nil || b.builder.qry == nil {
 			return
 		}
-		nodeID, ok := b.builder.tag2NodeID[col.RelPos]
-		if !ok || nodeID < 0 || int(nodeID) >= len(b.builder.qry.Nodes) {
-			return
+		var source *Expr
+		if b.ctx != nil && col.RelPos == b.ctx.groupTag {
+			source = b.pendingColumnSource(col)
+		} else {
+			nodeID, ok := b.builder.tag2NodeID[col.RelPos]
+			if !ok || nodeID < 0 || int(nodeID) >= len(b.builder.qry.Nodes) {
+				return
+			}
+			node := b.builder.qry.Nodes[nodeID]
+			if node == nil || col.ColPos < 0 {
+				return
+			}
+			outputs := node.ProjectList
+			if node.NodeType == plan.Node_AGG && len(node.BindingTags) > 0 && col.RelPos == node.BindingTags[0] {
+				outputs = node.GroupBy
+			}
+			if int(col.ColPos) >= len(outputs) {
+				return
+			}
+			source = outputs[col.ColPos]
 		}
-		node := b.builder.qry.Nodes[nodeID]
-		if node == nil || col.ColPos < 0 || int(col.ColPos) >= len(node.ProjectList) {
-			return
-		}
-		key := [2]int32{nodeID, col.ColPos}
+		key := [2]int32{col.RelPos, col.ColPos}
 		if witness, ok := memo[key]; ok {
 			if witness != nil {
 				ensurePreparedNumericMetadata(expr).StringDomainSource = DeepCopyExpr(witness)
@@ -5157,7 +5327,6 @@ func (b *baseBinder) annotateStringDomainSource(
 		}
 		visited[key] = struct{}{}
 		defer delete(visited, key)
-		source := node.ProjectList[col.ColPos]
 		if source == nil || source == expr {
 			memo[key] = nil
 			return
@@ -5778,28 +5947,6 @@ func preparedRegexpResultStringOperandCount(name string, arity int) int {
 
 func BindFuncExprImplByPlanExpr(ctx context.Context, name string, args []*Expr) (*plan.Expr, error) {
 	return bindFuncExprImplByPlanExpr(ctx, name, args, true, nil, nil, false)
-}
-
-func hexExplicitRealCastOverload(name string, args []*Expr) (int32, bool) {
-	if name != "hex" || len(args) != 1 || args[0] == nil {
-		return 0, false
-	}
-	cast := args[0].GetF()
-	if cast == nil || cast.GetFunc().GetObjName() != "cast" {
-		return 0, false
-	}
-	_, castOverload := function.DecodeOverloadID(cast.GetFunc().GetObj())
-	if castOverload == 0 && !cast.GetSyntaxExplicitCast() {
-		return 0, false
-	}
-	switch types.T(args[0].Typ.Id) {
-	case types.T_float32:
-		return function.HexExplicitFloat32Overload, true
-	case types.T_float64:
-		return function.HexExplicitFloat64Overload, true
-	default:
-		return 0, false
-	}
 }
 
 func bindPreparedFuncExprImplByPlanExpr(
@@ -6578,12 +6725,6 @@ func bindFuncExprImplByPlanExpr(
 		return nil, err
 	}
 
-	if overloadID, ok := hexExplicitRealCastOverload(name, args); ok {
-		fGet, err = function.GetFunctionByNameWithOverload(ctx, name, argsType, overloadID)
-		if err != nil {
-			return nil, err
-		}
-	}
 	funcID = fGet.GetEncodedOverloadID()
 	returnType = fGet.GetReturnType()
 	argsCastType, _ = fGet.ShouldDoImplicitTypeCast()
@@ -9407,6 +9548,16 @@ func appendBitwiseAggregateCastBeforeExpr(ctx context.Context, expr *Expr, toTyp
 }
 
 func appendCastBeforeExpr(ctx context.Context, expr *Expr, toType Type, isBin ...bool) (*Expr, error) {
+	if expr != nil && types.T(expr.Typ.Id).IsDateRelate() && types.T(toType.Id) == types.T_decimal256 {
+		// Temporal arithmetic already has exact casts to Decimal128. Preserve
+		// their packed-value and fractional-second rules before widening.
+		intermediate := types.New(types.T_decimal128, 38, max(expr.Typ.Scale, 0))
+		var err error
+		expr, err = appendCastBeforeExprWithOverload(ctx, expr, makePlan2Type(&intermediate), 0)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return appendCastBeforeExprWithOverload(ctx, expr, toType, 0, isBin...)
 }
 

@@ -75,6 +75,22 @@ func NewSnapshotNotFoundError(ctx context.Context, snapshotName string) error {
 	return moerr.NewInvalidInputf(ctx, "snapshot '%s' not found", snapshotName)
 }
 
+func resolveDivPrecisionIncrement(ctx CompilerContext) int32 {
+	value, err := ctx.ResolveVariable("div_precision_increment", true, false)
+	if err == nil {
+		if increment, ok := value.(int64); ok {
+			return int32(increment)
+		}
+	}
+	return function.DefaultDivPrecisionIncrement
+}
+
+// DDL expression binders are independent of QueryBuilder. Bind persisted
+// expressions with the same statement setting as ordinary SELECT expressions.
+func ddlExpressionContext(ctx CompilerContext, base context.Context) context.Context {
+	return function.WithDivPrecisionIncrement(base, resolveDivPrecisionIncrement(ctx))
+}
+
 func NewQueryBuilder(queryType plan.Query_StatementType, ctx CompilerContext, isPrepareStatement bool, skipStats bool) *QueryBuilder {
 	//
 	// There is a class of variables that controls SQL behavior.  To add such a variable, first
@@ -98,6 +114,7 @@ func NewQueryBuilder(queryType plan.Query_StatementType, ctx CompilerContext, is
 	var mysqlFullGroupByCompat bool
 	var boolSumAvgCompat bool
 	var noUnsignedSubtraction bool
+	divPrecisionIncrement := resolveDivPrecisionIncrement(ctx)
 
 	mode, err := ctx.ResolveVariable("sql_mode", true, false)
 	if err == nil {
@@ -109,7 +126,6 @@ func NewQueryBuilder(queryType plan.Query_StatementType, ctx CompilerContext, is
 			noUnsignedSubtraction = mysql.HasSQLMode(modeStr, mysql.SQLModeNoUnsignedSubtraction)
 		}
 	}
-
 	var aggSpillMem int64
 	aggSpillMemInt, err := ctx.ResolveVariable("agg_spill_mem", true, false)
 	if err == nil {
@@ -162,6 +178,7 @@ func NewQueryBuilder(queryType plan.Query_StatementType, ctx CompilerContext, is
 		mysqlFullGroupByCompat:   mysqlFullGroupByCompat,
 		boolSumAvgCompat:         boolSumAvgCompat,
 		noUnsignedSubtraction:    noUnsignedSubtraction,
+		divPrecisionIncrement:    divPrecisionIncrement,
 		aggSpillMem:              aggSpillMem,
 		joinSpillMem:             joinSpillMem,
 		sortSpillMem:             sortSpillMem,
@@ -4405,14 +4422,6 @@ func (builder *QueryBuilder) buildUnionWithResultLen(
 						metadata.ProvisionalResultPeerTypeId = source.Typ.Id
 						metadata.ProvisionalResultPeerWidth = source.Typ.Width
 						metadata.ProvisionalResultPeerScale = source.Typ.Scale
-					}
-				}
-				if preparedDeferredColumn && preparedExprContainsParam(builder.qry.Nodes[tmpID].ProjectList[columnIdx]) {
-					metadata := ensurePreparedNumericMetadata(builder.qry.Nodes[tmpID].ProjectList[columnIdx])
-					metadata.Fallback = true
-					metadata.ParamPos = -1
-					if pos, ok := firstPlanParamPosition(builder.qry.Nodes[tmpID].ProjectList[columnIdx]); ok {
-						metadata.ParamPos = pos
 					}
 				}
 			}
@@ -13382,7 +13391,8 @@ func (builder *QueryBuilder) GetContext() context.Context {
 	if builder == nil {
 		return context.TODO()
 	}
-	return function.WithNoUnsignedSubtraction(builder.compCtx.GetContext(), builder.noUnsignedSubtraction)
+	ctx := function.WithNoUnsignedSubtraction(builder.compCtx.GetContext(), builder.noUnsignedSubtraction)
+	return function.WithDivPrecisionIncrement(ctx, builder.divPrecisionIncrement)
 }
 
 func (builder *QueryBuilder) checkPlanningCanceled() error {
