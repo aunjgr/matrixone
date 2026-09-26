@@ -25,14 +25,10 @@ RUN module_files="$(sha256sum go.mod go.sum)" && \
 
 RUN cd optools/gpu && pixi run --frozen make -C ../.. MO_CL_CUDA=1 -j8
 
-# Stage user-space libraries from the selected Pixi environment. Only the
-# top-level CUDA target library directory is copied: its stubs/ subdirectory
-# is link-only and must never enter the runtime image.
-RUN mkdir -p /gpu-runtime && \
-    cp -a optools/gpu/.pixi/envs/default/lib/*.so* /gpu-runtime/ && \
-    cp -a optools/gpu/.pixi/envs/default/targets/x86_64-linux/lib/*.so* /gpu-runtime/ && \
-    test -z "$(find /gpu-runtime -maxdepth 1 \
-      \( -name 'libcuda.so*' -o -name 'libnvidia-*' \) -print -quit)"
+# Stage user-space libraries without dangling cross-directory Pixi symlinks or
+# silent basename collisions. Driver stubs are link-only and never packaged.
+RUN sh optools/images/gpu/stage-runtime-libs.sh \
+    optools/gpu/.pixi/envs/default /gpu-runtime
 
 FROM ubuntu:24.04
 

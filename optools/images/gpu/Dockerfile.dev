@@ -29,11 +29,8 @@ RUN cd matrixone && \
 RUN cd matrixone/optools/gpu && \
     pixi run --frozen make -C ../.. MO_CL_CUDA=1 -j8
 
-RUN mkdir -p /gpu-runtime && \
-    cp -a matrixone/optools/gpu/.pixi/envs/default/lib/*.so* /gpu-runtime/ && \
-    cp -a matrixone/optools/gpu/.pixi/envs/default/targets/x86_64-linux/lib/*.so* /gpu-runtime/ && \
-    test -z "$(find /gpu-runtime -maxdepth 1 \
-      \( -name 'libcuda.so*' -o -name 'libnvidia-*' \) -print -quit)"
+RUN sh matrixone/optools/images/gpu/stage-runtime-libs.sh \
+    matrixone/optools/gpu/.pixi/envs/default /gpu-runtime
 
 FROM ubuntu:24.04
 
