@@ -199,64 +199,132 @@
   "bundle_bytes": 686682,
   "bundle_file_count": 112,
   "current_delivery": {
-    "revision": "d0302953df0a4b3858cf89666a2336f3ded93a99",
-    "base": "35c8dd5854750ef96f52f9dd298a70acd031d5e4",
+    "revision": "195457c2fde69399f3a8f9e61d72dcb480c39dcc",
+    "base": "8586fa08715c868cab997d11d2687a76b8cc360f",
     "sirius_revision": "06400cf48073e51955067bfd75c5c4defe955a72",
     "sdk_sha256": "878c0ec8b2d27f8efbac9325159903fb5ba87d5448692ab95938f10cb18077bc",
-    "archive": "delivery-d0302953df.tar.gz",
-    "archive_sha256": "1bbad09c2fe019078cfe220cafba89f54b7f2da788d35c5de0aba8c41b3d19ab",
-    "archive_bytes": 66241,
+    "archive": "delivery-195457c2fd.tar.gz",
+    "archive_sha256": "9cebf8b98d4ff51bb4f33eae0508341afa3a7fa3b71877dfcd65516828251e7a",
+    "archive_bytes": 198984,
     "files": {
-      "acceptance.json": "7b36b3a09336e2a41deadd82ff432d334c5e4e4a8ac103f3813832f2b10f21ed",
-      "bvt-1.log": "4555d72b5114c13a8b973ca26276302df72210adf1fe278caba70423d58b163c",
-      "bvt-2.log": "c3ffe3d2ba7c4ccf23dfe30d3a8b4e99556357884d5d54efd207cc2a94cf62df",
-      "consumer-migration.patch": "675051e3c58ff868da137c8eb83419a0a65443a42d046faf30b09ce7460bb239",
-      "focused.log": "d76ca351544b862e0d4ccb5aad2277f0b4557165fa16ac8b7324580266c50b2d",
-      "frontend.log": "b4f3b936e113b4243353559e8d6e0d3851923fbe554047187fca7ec05225c090",
-      "gpu-bridge.log": "169a055650438d66bf2089d2f2e5e2b72613104e66cdf463140f86bb35236550",
-      "migration-review.json": "dcb2d10d55e4f3c7f3c1ffa2ba5518bc45968c085326f69ea142bd23f8837ef7",
-      "native22.log": "817efa2d60c20f22e36c7d2a897490d0fd63b67f5f9a5ae6db24577c28e58115",
-      "owning-explain.log": "b54d6f444e196a3530834285ee92e4cc20d7455ec5900dcbb75af17d8c8c584c",
-      "prepush.log": "4bcdf43a8f33c2d30eb5e08ce49c95675e8bae02831e6fb53b7d1931920a7f73",
-      "service-build.log": "722ee88aaf14acfcc8864022fc587468bc9faebe922c0ceab5150c0474b996e5"
+      "bvt-1.log": "2808d1e7b8d3147b1af7c8868d6396f9abc36b759a74b4ccd19eca850144ccf9",
+      "bvt-2.log": "ad8bb7b76ff1ace25396cb605bd84ee50ec8d78c082f4d42e33e2a547390ecf3",
+      "collation-race.log": "9ef7880ae4798b90774a255771249d1c205f1d572d496c634e7e355ece083b4a",
+      "collation.log": "266b79a0d6a827dd98722bfe77f73ccbff72d0cb428b3ed7acc82dc3add6f21b",
+      "evidence-prepush.log": "4836d68d3279becf79309f8966e81d4c64e79d7153474430b95bfa8c71f86742",
+      "gpu-bridge.log": "a923763b84da6a621330cbc2896825c8cff4f18d82fed52ad50ac4c2d07fb5a0",
+      "native22.log": "b58f195ff7ca7e66c8215f9a696c689b5ca757215c3178f117973886e62eb3a5",
+      "owners.log": "6bb55b1eda321295ce320d7a4e27e00c1982a07dfd5609b9ab0b4e7ff68b45c5",
+      "review.json": "c0206a7a042864eb2d9141016739ca1120e6d4282fd55b398e549279f2a336a2",
+      "service-build.log": "a5588d2fd829acc173e666926cba3deee0f5de1ecdba814d6365d9bbb65cd507"
     },
-    "new_native22": {
-      "cases": 22,
-      "elapsed_seconds": 0.76,
-      "exit": 0
+    "checks": {
+      "collation": {
+        "exit": 0,
+        "named_pass_events": 12
+      },
+      "owners": {
+        "exit": 0,
+        "named_pass_events": 11070
+      },
+      "collation-race": {
+        "exit": 0,
+        "named_pass_events": 22
+      },
+      "native22": {
+        "exit": 0,
+        "named_pass_events": 23
+      },
+      "gpu-bridge": {
+        "exit": 0,
+        "named_pass_events": 5
+      },
+      "service-build": {
+        "exit": 0,
+        "named_pass_events": 0
+      },
+      "bvt": {
+        "exit": 0,
+        "iterations": 2,
+        "statements_per_iteration": 115,
+        "teardown_verified": true
+      },
+      "full_sca": {
+        "exit": 0,
+        "issues": 0,
+        "source_evidence": "evidence-prepush.log",
+        "validity": "Identical Go/native/build inputs between source and evidence checkout; only artifact paths differ."
+      }
     },
-    "new_gpu_bridge": {
-      "roots": [
-        "TestNativeBridgeCoexistsWithCuvsInOneProcess",
-        "TestNativeBridgeDataAndCancellation"
-      ],
-      "elapsed_seconds": 0.823,
-      "exit": 0
-    },
-    "reused_migration": {
-      "focused_cases_and_subcases": 71,
-      "owning_cases_and_subcases": 337,
-      "frontend_cases_and_subcases": 88,
-      "bvt_statements_per_run": 68,
-      "bvt_runs": 2,
-      "service_build_exit": 0,
-      "full_sca_exit": 0,
-      "golangci_issues": 0
-    },
-    "binary_identity": {
-      "reported_head": "01def75b24",
-      "working_patch_sha256": "675051e3c58ff868da137c8eb83419a0a65443a42d046faf30b09ce7460bb239",
-      "binary_sha256": "c04be695d4901320e208de5b5d9269451fde33b46eabbb296899d5a80f17f711",
-      "source_formatter_sha256": "6469ea9cbd9cb4a812bee49d6a0da92f225baff9096d55c467b68a460fa512a7",
-      "native_sha": "06400cf48073e51955067bfd75c5c4defe955a72",
-      "sdk_fingerprint": "878c0ec8b2d27f8efbac9325159903fb5ba87d5448692ab95938f10cb18077bc"
-    },
-    "original_acceptance_byte_identical": true,
-    "current_acceptance_local_complete": true,
+    "binary_sha256": "421de6f2f109239a5678a325a46a647998d0b6159cfeff75a2e62408fd592bfb",
+    "original_acceptance_sha256": "dad13b3c3fc6bf7a2aba545fbb173e0aea7e457e0b65080b66ec8fceb43583cc",
     "limits": [
-      "Original8f/0cc performance captures and4e source qualification retain their actual identities; this supplement adds current delivery tests, not a benchmark rerun.",
-      "Coverage UT on d030 did not execute because runner source checkout timed out; no passing coverage result is claimed.",
-      "Remote CI and maintainer approval remain external gates."
+      "Original8f/0cc performance captures and4e/d030 qualification retain their actual identities; latest qualification adds195457/main8586 functional, native/GPU, guarded-build, race, BVT and full-SCA evidence.",
+      "No new full-data benchmark or passing remote coverage result is claimed.",
+      "Fresh delivery CI and maintainer review remain external gates."
     ]
-  }
+  },
+  "prior_deliveries": [
+    {
+      "revision": "d0302953df0a4b3858cf89666a2336f3ded93a99",
+      "base": "35c8dd5854750ef96f52f9dd298a70acd031d5e4",
+      "sirius_revision": "06400cf48073e51955067bfd75c5c4defe955a72",
+      "sdk_sha256": "878c0ec8b2d27f8efbac9325159903fb5ba87d5448692ab95938f10cb18077bc",
+      "archive": "delivery-d0302953df.tar.gz",
+      "archive_sha256": "1bbad09c2fe019078cfe220cafba89f54b7f2da788d35c5de0aba8c41b3d19ab",
+      "archive_bytes": 66241,
+      "files": {
+        "acceptance.json": "7b36b3a09336e2a41deadd82ff432d334c5e4e4a8ac103f3813832f2b10f21ed",
+        "bvt-1.log": "4555d72b5114c13a8b973ca26276302df72210adf1fe278caba70423d58b163c",
+        "bvt-2.log": "c3ffe3d2ba7c4ccf23dfe30d3a8b4e99556357884d5d54efd207cc2a94cf62df",
+        "consumer-migration.patch": "675051e3c58ff868da137c8eb83419a0a65443a42d046faf30b09ce7460bb239",
+        "focused.log": "d76ca351544b862e0d4ccb5aad2277f0b4557165fa16ac8b7324580266c50b2d",
+        "frontend.log": "b4f3b936e113b4243353559e8d6e0d3851923fbe554047187fca7ec05225c090",
+        "gpu-bridge.log": "169a055650438d66bf2089d2f2e5e2b72613104e66cdf463140f86bb35236550",
+        "migration-review.json": "dcb2d10d55e4f3c7f3c1ffa2ba5518bc45968c085326f69ea142bd23f8837ef7",
+        "native22.log": "817efa2d60c20f22e36c7d2a897490d0fd63b67f5f9a5ae6db24577c28e58115",
+        "owning-explain.log": "b54d6f444e196a3530834285ee92e4cc20d7455ec5900dcbb75af17d8c8c584c",
+        "prepush.log": "4bcdf43a8f33c2d30eb5e08ce49c95675e8bae02831e6fb53b7d1931920a7f73",
+        "service-build.log": "722ee88aaf14acfcc8864022fc587468bc9faebe922c0ceab5150c0474b996e5"
+      },
+      "new_native22": {
+        "cases": 22,
+        "elapsed_seconds": 0.76,
+        "exit": 0
+      },
+      "new_gpu_bridge": {
+        "roots": [
+          "TestNativeBridgeCoexistsWithCuvsInOneProcess",
+          "TestNativeBridgeDataAndCancellation"
+        ],
+        "elapsed_seconds": 0.823,
+        "exit": 0
+      },
+      "reused_migration": {
+        "focused_cases_and_subcases": 71,
+        "owning_cases_and_subcases": 337,
+        "frontend_cases_and_subcases": 88,
+        "bvt_statements_per_run": 68,
+        "bvt_runs": 2,
+        "service_build_exit": 0,
+        "full_sca_exit": 0,
+        "golangci_issues": 0
+      },
+      "binary_identity": {
+        "reported_head": "01def75b24",
+        "working_patch_sha256": "675051e3c58ff868da137c8eb83419a0a65443a42d046faf30b09ce7460bb239",
+        "binary_sha256": "c04be695d4901320e208de5b5d9269451fde33b46eabbb296899d5a80f17f711",
+        "source_formatter_sha256": "6469ea9cbd9cb4a812bee49d6a0da92f225baff9096d55c467b68a460fa512a7",
+        "native_sha": "06400cf48073e51955067bfd75c5c4defe955a72",
+        "sdk_fingerprint": "878c0ec8b2d27f8efbac9325159903fb5ba87d5448692ab95938f10cb18077bc"
+      },
+      "original_acceptance_byte_identical": true,
+      "current_acceptance_local_complete": true,
+      "limits": [
+        "Original8f/0cc performance captures and4e source qualification retain their actual identities; this supplement adds current delivery tests, not a benchmark rerun.",
+        "Coverage UT on d030 did not execute because runner source checkout timed out; no passing coverage result is claimed.",
+        "Remote CI and maintainer approval remain external gates."
+      ]
+    }
+  ]
 }
