@@ -733,7 +733,7 @@ func TestBuildSQLJSONPlanPreservesVectorExecutionSettings(t *testing.T) {
 				NodeId:   0,
 				NodeType: plan.Node_INDEX_SEARCH_SCAN,
 				IndexSearchScan: &plan.IndexSearchScan{
-					Index:               &plan.IndexDef{IndexName: "idx_embedding"},
+					Index:               &plan.IndexDef{IndexName: "idx_embedding", IndexAlgo: "ivfflat"},
 					Direction:           direction,
 					AlgoOptions:         []byte(fmt.Sprintf(`{"initial_probe_count":%d,"bucket_expand_step":%d}`, probe, expand)),
 					PostFilterOverFetch: overfetch,
@@ -754,8 +754,10 @@ func TestBuildSQLJSONPlanPreservesVectorExecutionSettings(t *testing.T) {
 	high := buildExpressions(16, plan.OrderBySpec_DESC, 8, true)
 	require.NotEqual(t, low, high)
 	require.Contains(t, low, "algo_options_base64="+base64.StdEncoding.EncodeToString([]byte(`{"initial_probe_count":1,"bucket_expand_step":2}`)))
+	require.Contains(t, low, "algo_setting[0]=NProbe: 1")
 	require.Contains(t, low, "direction=ASC")
 	require.Contains(t, high, "algo_options_base64="+base64.StdEncoding.EncodeToString([]byte(`{"initial_probe_count":16,"bucket_expand_step":8}`)))
+	require.Contains(t, high, "algo_setting[0]=NProbe: 16")
 	require.Contains(t, high, "direction=DESC")
 	require.Contains(t, high, "post_filter_over_fetch=true")
 }
@@ -898,4 +900,77 @@ func TestSQLJSONTableAndTargetNameFallbacks(t *testing.T) {
 	require.Empty(t, sqlJSONBoundTableAlias(&plan.Node{TableDef: &plan.TableDef{Name: "t", Cols: []*plan.ColDef{sqlJSONTestColumn("id")}}, ProjectList: []*plan.Expr{{Expr: &plan.Expr_Col{Col: &plan.ColRef{ColPos: 0, Name: "a.id"}}}, {Expr: &plan.Expr_Col{Col: &plan.ColRef{ColPos: 0, Name: "b.id"}}}}}))
 	require.Equal(t, []*plan.Expr{sqlJSONTestInt32(1), sqlJSONTestInt32(2)}, sqlJSONLimitExpressions(&plan.Node{Limit: sqlJSONTestInt32(1), Offset: sqlJSONTestInt32(2)}))
 	require.Empty(t, sqlJSONLimitExpressions(nil))
+}
+
+func TestBuildSQLJSONPlanPreservesIndexSearchWireMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		algo     string
+		payload  *plan.Expr
+		options  []byte
+		operator string
+		want     string
+	}{
+		{"ivfflat", &plan.Expr{Expr: &plan.Expr_Lit{Lit: &plan.Literal{Value: &plan.Literal_VecVal{VecVal: "[1,2]"}}}}, []byte(`{"initial_probe_count":7,"bucket_expand_step":3,"threads_search":2}`), "Vector Index Scan", "algo_setting[0]=NProbe: 7"},
+		{"fulltext", planpkg.MakePlan2StringConstExprWithType("needle"), nil, "Fulltext Index Scan", "needle"},
+		{"fulltext2", planpkg.MakePlan2StringConstExprWithType("needle"), nil, "Fulltext Index Scan", "needle"},
+		{"future_plugin", sqlJSONTestInt32(1), []byte{0, 255, 'x'}, "Vector Index Scan", "query_payload=1"},
+	} {
+		t.Run(tc.algo, func(t *testing.T) {
+			query := &plan.Query{StmtType: plan.Query_SELECT, Steps: []int32{0}, Nodes: []*plan.Node{{
+				NodeType: plan.Node_INDEX_SEARCH_SCAN,
+				IndexSearchScan: &plan.IndexSearchScan{
+					SourceTable:    &plan.ObjectRef{SchemaName: "db", ObjName: "items"},
+					Index:          &plan.IndexDef{IndexName: "idx", IndexAlgo: tc.algo},
+					QueryPayload:   tc.payload,
+					AlgoOptions:    tc.options,
+					AlgoExprNames:  []string{"first_round_limit"},
+					AlgoExprs:      []*plan.Expr{sqlJSONTestInt32(4)},
+					CandidateLimit: sqlJSONTestInt32(12),
+				},
+			}}}
+			wire, err := query.Marshal()
+			require.NoError(t, err)
+			var remote plan.Query
+			require.NoError(t, remote.Unmarshal(wire))
+			raw, err := BuildSQLJSONPlan(t.Context(), &remote)
+			require.NoError(t, err)
+			var decoded sqlJSONPlan
+			require.NoError(t, json.Unmarshal(raw, &decoded))
+			require.Len(t, decoded.MatrixOne.Nodes, 1)
+			node := decoded.MatrixOne.Nodes[0]
+			require.Equal(t, tc.operator, node.Operator)
+			require.Equal(t, "db.items", node.TableName)
+			require.Contains(t, strings.Join(node.Expressions, "\n"), tc.want)
+			require.Contains(t, node.Expressions, "candidate_limit=12")
+			require.Contains(t, node.Expressions, `algo_expr["first_round_limit"]=4`)
+			if len(tc.options) != 0 {
+				require.Contains(t, node.Expressions, "algo_options_base64="+base64.StdEncoding.EncodeToString(tc.options))
+			}
+		})
+	}
+}
+
+func TestSQLJSONIndexSearchRejectsMalformedAlgorithmMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		names []string
+		exprs []*plan.Expr
+	}{
+		{"missing name", nil, []*plan.Expr{sqlJSONTestInt32(1)}},
+		{"missing expression", []string{"limit"}, nil},
+		{"empty name", []string{""}, []*plan.Expr{sqlJSONTestInt32(1)}},
+		{"nil expression", []string{"limit"}, []*plan.Expr{nil}},
+		{"duplicate name", []string{"limit", "limit"}, []*plan.Expr{sqlJSONTestInt32(1), sqlJSONTestInt32(2)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := sqlJSONIndexSearchExpressions(t.Context(), &plan.IndexSearchScan{
+				Index: &plan.IndexDef{IndexName: "idx"}, AlgoExprNames: tc.names, AlgoExprs: tc.exprs,
+			}, &ExplainOptions{Format: EXPLAIN_FORMAT_TEXT})
+			require.Error(t, err)
+		})
+	}
+	_, err := sqlJSONIndexSearchExpressions(t.Context(), &plan.IndexSearchScan{
+		Index: &plan.IndexDef{IndexName: "idx", IndexAlgo: "ivfflat"}, AlgoOptions: []byte("{"),
+	}, &ExplainOptions{Format: EXPLAIN_FORMAT_TEXT})
+	require.Error(t, err)
 }

@@ -82,23 +82,6 @@ explain format=json select id, tag from vectors_include order by l2_distance(v,'
 drop table vectors_include;
 set probe_limit=default;
 
--- INDEX_SEARCH_SCAN also carries fulltext payloads through the same protocol.
-set experimental_fulltext_index=1;
-set experimental_fulltext2_index=1;
-create table documents(id bigint primary key, body text);
-create fulltext index ix_text on documents(body);
--- @regex("(?s)Fulltext Index Scan.*query_payload=[^a-zA-Z0-9_]*needle([^a-zA-Z0-9_]|$)",true)
-explain format=json select id from documents where match(body) against('needle') > 0;
-drop table documents;
-create table documents(id bigint primary key, body text);
-create fulltext2 index ix_text on documents(body) with parser ngram;
--- @regex("(?s)Fulltext Index Scan.*query_payload=[^a-zA-Z0-9_]*needle([^a-zA-Z0-9_]|$)",true)
-explain format=json select id from documents where match(body) against('needle') > 0;
-drop table documents;
-set experimental_fulltext_index=default;
-set experimental_fulltext2_index=default;
-
-
 -- FILL preserves mode and the targets remaining after projection pruning.
 create table fill_values(ts timestamp, v int);
 insert into fill_values values ('2024-01-01 00:00:00',1),('2024-01-01 00:00:10',3);
