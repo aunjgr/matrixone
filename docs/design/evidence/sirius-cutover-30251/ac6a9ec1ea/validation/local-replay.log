@@ -1,0 +1,115 @@
+{
+  "baseline_timing_runs": 744,
+  "candidate_timing_runs": 744,
+  "head": "ac6a9ec1ea234bca1ffabbaf59127536a7c5d978",
+  "local_acceptance_complete": true,
+  "numeric_gates": [
+    {
+      "id": "cudf_add64",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 1.004353918007265
+    },
+    {
+      "id": "checked_add64",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 0.9783254156769596
+    },
+    {
+      "id": "cudf_widen_multiply64_to128",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 0.9965783014534632
+    },
+    {
+      "id": "checked_multiply64_to128",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 0.997102846908758
+    },
+    {
+      "id": "checked_add256",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 1.007054680443176
+    },
+    {
+      "id": "checked_divide256",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 1.000014842583797
+    },
+    {
+      "id": "ordinary_expression_add64",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 0.9912425046742304
+    },
+    {
+      "id": "exact_expression_add64",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 0.9944594849839452
+    },
+    {
+      "id": "cudf_sum64_to128",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 1.0008470238161002
+    },
+    {
+      "id": "exact_sum64_to128",
+      "limit": 1.1,
+      "passed": true,
+      "ratio": 0.9989843666668213
+    }
+  ],
+  "performance": [
+    {
+      "baseline_seconds": 1.715086639,
+      "candidate_seconds": 1.628399895,
+      "limit": 1.05,
+      "metric": "median_full_suite",
+      "ratio": 0.9494563469688367,
+      "scale": "SF1"
+    },
+    {
+      "baseline_seconds": 1.723996727,
+      "candidate_seconds": 1.612995816,
+      "limit": 1.05,
+      "metric": "sum_query_medians",
+      "ratio": 0.9356141985297399,
+      "scale": "SF1"
+    },
+    {
+      "baseline_seconds": 14.13333252,
+      "candidate_seconds": 13.621069742,
+      "limit": 1.05,
+      "metric": "median_full_suite",
+      "ratio": 0.9637549900368437,
+      "scale": "SF10"
+    },
+    {
+      "baseline_seconds": 13.873636861,
+      "candidate_seconds": 13.587980436,
+      "limit": 1.05,
+      "metric": "sum_query_medians",
+      "ratio": 0.9794101267128446,
+      "scale": "SF10"
+    }
+  ],
+  "raw_profiles_reconciled": 6,
+  "remaining_gates": [
+    "reviewer-approval"
+  ],
+  "resource_runs": 264,
+  "unexplained_growth_bytes": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ]
+}

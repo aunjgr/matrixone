@@ -1,0 +1,16 @@
+{
+  "command": [
+    "python3",
+    "-B",
+    "verify.py",
+    "--scratch",
+    "/home/aunjbr/codebase/work/matrixone/build/mo30251-cutover-evidence-y9_7zeat/work"
+  ],
+  "cwd": "/home/aunjbr/codebase/work/matrixone/build/mo30251-cutover-evidence-y9_7zeat/bundle",
+  "environment_overrides": {},
+  "started_at": "2026-10-15T08:59:31.953847+00:00",
+  "exit_status": 0,
+  "completed_at": "2026-10-15T08:59:40.486241+00:00",
+  "output_sha256": "e5a7bfc3d1c4605627066c9dc7b935528011faf479e82ab93e2b8638869065bb",
+  "output_file": "local-replay.log"
+}
