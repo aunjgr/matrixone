@@ -48,12 +48,17 @@ type MemCache struct {
 	lastStatsUpdate     atomic.Int64
 	statsRefreshPending atomic.Bool
 	closed              atomic.Bool
+	transientDecoder    transientDecodeAllocator
+	nonEvictingDecoder  nonEvictingDecodeAllocator
 
 	// Capacity decisions and the reservation-to-FIFO handoff share this lock.
-	// Releases only decrease reservedBytes and must not reacquire it from the
-	// handoff callback.
+	// Releases only decrease reservedBytes/backingBytes and must not reacquire
+	// the lock from the handoff callback.
 	capacityMu    sync.Mutex
 	reservedBytes atomic.Int64
+	// backingBytes includes pending reservations and every live backing allocation,
+	// even after eviction while a reader still retains its buffer.
+	backingBytes atomic.Int64
 
 	// idleCacheData contains native buffers whose capacity was reserved but
 	// which were released before FIFO insertion. Keeping these exact
@@ -104,8 +109,20 @@ func (r *memoryCacheReservation) commit() {
 }
 
 func (r *memoryCacheReservation) release() {
-	if r.state.CompareAndSwap(memoryCacheReservationPending, memoryCacheReservationReleased) {
-		r.cache.releaseReservedBytes(r.bytes)
+	for {
+		state := r.state.Load()
+		if state == memoryCacheReservationReleased {
+			return
+		}
+		if r.state.CompareAndSwap(state, memoryCacheReservationReleased) {
+			if state == memoryCacheReservationPending {
+				r.cache.releaseReservedBytes(r.bytes)
+			}
+			if r.cache.backingBytes.Add(-r.bytes) < 0 {
+				panic("memory cache backing charge underflow")
+			}
+			return
+		}
 	}
 }
 
@@ -263,7 +280,8 @@ func newMemCacheWithMetricScope(
 	allocatorGauges := metric.GetFsCacheAllocatorStatsGaugesWithScope(metricScope, name, "mem")
 	capacityBytes.Set(float64(capacity()))
 
-	capacityFunc := func() int64 {
+	var ret *MemCache
+	configuredCapacity := func() int64 {
 		// read from global hint
 		if n := GlobalMemoryCacheSizeHint.Load(); n > 0 {
 			return n
@@ -271,10 +289,11 @@ func newMemCacheWithMetricScope(
 		// fallback
 		return capacity()
 	}
+	capacityFunc := configuredCapacity
 
 	var dataCache *fifocache.DataCache
 	cacheAllocator, arenaAllocator := newMemoryCacheDataAllocator()
-	ret := &MemCache{
+	ret = &MemCache{
 		counterSets:       counterSets,
 		allocator:         cacheAllocator,
 		uncachedAllocator: newBytesAllocator(ioAllocator()),
@@ -282,6 +301,8 @@ func newMemCacheWithMetricScope(
 		allocatorGauges:   allocatorGauges,
 		metricKey:         memoryCacheMetricKey{scope: metricScope, name: name},
 	}
+	ret.transientDecoder.cache = ret
+	ret.nonEvictingDecoder.cache = ret
 
 	prepareSetFn := func(_ context.Context, _ fscache.CacheKey, value fscache.Data, _, _ int64, _ uint64) func(inserted bool) {
 		value.Retain()
@@ -453,6 +474,7 @@ func (m *MemCache) reserveCacheData(ctx context.Context, bytes int) *memoryCache
 		reserved := m.reservedBytes.Load()
 		if want <= capacity-used-reserved {
 			m.reservedBytes.Add(want)
+			m.backingBytes.Add(want)
 			m.capacityMu.Unlock()
 			return &memoryCacheReservation{cache: m, bytes: want}
 		}
@@ -678,6 +700,7 @@ func (m *MemCache) Read(
 ) {
 
 	if vector.Policy.Any(SkipMemoryCacheReads) {
+		m.prepareDecodeAllocation(vector)
 		return nil
 	}
 
@@ -741,6 +764,7 @@ func (m *MemCache) Read(
 			numHit++
 		}
 	}
+	m.prepareDecodeAllocation(vector)
 
 	return
 }
@@ -770,6 +794,25 @@ func (m *MemCache) Update(
 		}
 		if !m.cacheAdmissionAllowed(entry.CachedData) {
 			metric.FSCachePressureMemorySkipCounter.Inc()
+			continue
+		}
+
+		if vector.Policy.Any(MemoryCacheNoEvict) {
+			owned, owns := entry.CachedData.(fscache.DataOwnership)
+			_, reserved := entry.CachedData.(fscache.DataCacheReservation)
+			cache, supports := m.cache.(*fifocache.DataCache)
+			if !supports || !owns || !reserved || owned.CacheDataOwner() != m.allocator.owner {
+				continue
+			}
+			key := fscache.CacheKey{Path: path.File, Offset: entry.Offset, Sz: entry.Size}
+			_, err := cache.SetWithoutEviction(ctx, key, entry.CachedData, m.nonEvictingPublicationAllowed)
+			if errors.Is(err, fscache.ErrCacheAdmissionRejected) {
+				metric.FSCachePressureMemorySkipCounter.Inc()
+				continue
+			}
+			if err != nil {
+				return err
+			}
 			continue
 		}
 
