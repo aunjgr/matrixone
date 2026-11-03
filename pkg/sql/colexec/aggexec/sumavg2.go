@@ -1418,6 +1418,9 @@ func (exec *sumAvgDecExec[A, S]) BatchFill(offset int, groups []uint64, vectors 
 }
 
 func (exec *sumAvgDecExec[A, S]) batchFillSum(offset int, groups []uint64, vectors []*vector.Vector) error {
+	if len(exec.state) == 1 && exec.state[0].length <= 256 {
+		return exec.batchFillDense(offset, groups, vectors[0])
+	}
 	vec := vectors[0]
 	n := len(groups)
 	if n == 0 {
@@ -1524,6 +1527,9 @@ func (exec *sumAvgDecExec[A, S]) batchFillSum(offset int, groups []uint64, vecto
 }
 
 func (exec *sumAvgDecExec[A, S]) batchFillAvg(offset int, groups []uint64, vectors []*vector.Vector) error {
+	if len(exec.state) == 1 && exec.state[0].length <= 256 {
+		return exec.batchFillDense(offset, groups, vectors[0])
+	}
 	vec := vectors[0]
 	n := len(groups)
 	if n == 0 {
